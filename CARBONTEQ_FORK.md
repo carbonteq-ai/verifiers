@@ -42,5 +42,6 @@ host-client injection seam. Before rebasing, check again for an equivalent
 upstream capability, run the three local integrations and the upstream
 client/interception regression suites, then build and clean-install the wheel.
 
-Published implementation commit: pending.
-Consumer revision: pending.
+Published implementation commit:
+`8e8f3042481c0996a58c3de0f86d55406725b6c1`.
+Consumer revision: `8e8f3042481c0996a58c3de0f86d55406725b6c1`.
