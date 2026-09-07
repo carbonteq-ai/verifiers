@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Annotated
 from pydantic import Field
 from pydantic_config import BaseConfig
 
+from verifiers.v1.clients.client import ClientFactory
 from verifiers.v1.interception.base import BaseInterceptionConfig, Interception, Slot
 from verifiers.v1.interception.pool import (
     ElasticInterceptionPool,
@@ -60,15 +61,22 @@ def make_interception(
     *,
     requires_tunnel: bool,
     state_service_secrets: tuple[str, ...] = (),
+    client_factory: ClientFactory | None = None,
 ) -> Interception:
     """The interception for a config, picked by type (the host-side counterpart to
     `make_runtime`). With `requires_tunnel`, each server is exposed through its configured
     tunnel; otherwise it remains on host loopback. The caller computes this requirement."""
     if isinstance(config, InterceptionServerConfig):
-        return InterceptionServer(config, requires_tunnel, state_service_secrets)
+        return InterceptionServer(
+            config, requires_tunnel, state_service_secrets, client_factory
+        )
     if isinstance(config, StaticInterceptionPoolConfig):
-        return StaticInterceptionPool(config, requires_tunnel, state_service_secrets)
-    return ElasticInterceptionPool(config, requires_tunnel, state_service_secrets)
+        return StaticInterceptionPool(
+            config, requires_tunnel, state_service_secrets, client_factory
+        )
+    return ElasticInterceptionPool(
+        config, requires_tunnel, state_service_secrets, client_factory
+    )
 
 
 @asynccontextmanager

@@ -70,6 +70,9 @@ class Client(ABC):
         pass
 
 
+ClientFactory = Callable[[BaseClientConfig], Client]
+
+
 def resolve_client(config: BaseClientConfig) -> Client:
     if isinstance(config, TrainClientConfig):
         from verifiers.v1.clients.train import TrainClient
