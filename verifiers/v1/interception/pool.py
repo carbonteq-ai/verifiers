@@ -21,6 +21,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from verifiers.v1.clients.client import ClientFactory
 from verifiers.v1.interception.base import BaseInterceptionConfig, Interception, Slot
 from verifiers.v1.interception.server import (
     InterceptionServer,
@@ -52,11 +53,14 @@ class StaticInterceptionPool(Interception):
         config: StaticInterceptionPoolConfig,
         requires_tunnel: bool = False,
         state_service_secrets: tuple[str, ...] = (),
+        client_factory: ClientFactory | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.servers = [
-            InterceptionServer(server, requires_tunnel, state_service_secrets)
+            InterceptionServer(
+                server, requires_tunnel, state_service_secrets, client_factory
+            )
             for server in config.servers
         ]
 
@@ -94,11 +98,13 @@ class ElasticInterceptionPool(Interception):
         config: ElasticInterceptionPoolConfig | None = None,
         requires_tunnel: bool = False,
         state_service_secrets: tuple[str, ...] = (),
+        client_factory: ClientFactory | None = None,
     ) -> None:
         super().__init__()
         self.config = config or ElasticInterceptionPoolConfig()
         self.requires_tunnel = requires_tunnel
         self.state_service_secrets = state_service_secrets
+        self.client_factory = client_factory
         self.servers: list[InterceptionServer] = []
         self._lock = asyncio.Lock()
         self._warm_task: asyncio.Task[InterceptionServer] | None = None
@@ -125,6 +131,7 @@ class ElasticInterceptionPool(Interception):
             InterceptionServerConfig(tunnel=PrimeTunnelConfig()),
             self.requires_tunnel,
             self.state_service_secrets,
+            self.client_factory,
         )
         await self.stack.enter_async_context(server)
         self.servers.append(server)

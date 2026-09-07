@@ -10,6 +10,81 @@ import pytest
 mark = pytest.mark
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interception",
+    [
+        {"type": "server"},
+        {"type": "elastic"},
+        {"type": "static", "servers": [{}]},
+    ],
+)
+async def test_host_client_factory_runs_local_episode_and_closes_adapter(interception):
+    """Real local harness and interception, with host-owned inference and no API key."""
+    from verifiers.v1 import AssistantMessage, ModelContext, Response, Sampling
+    from verifiers.v1.clients.client import Client
+    from verifiers.v1.configs.client import EvalClientConfig
+    from verifiers.v1.utils.loaders import load_environment, resolve_env_config
+
+    calls, closed = [], []
+
+    class HostClient(Client):
+        async def get_response(
+            self, dialect, body, sampling, session_id=None, turn=None, headers=None
+        ):
+            calls.append((body["model"], session_id))
+            response = Response(
+                id="host-response",
+                created=0,
+                model=body["model"],
+                message=AssistantMessage(content="ready"),
+                finish_reason="stop",
+            )
+            response.raw = {
+                "id": response.id,
+                "object": "chat.completion",
+                "created": 0,
+                "model": body["model"],
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ready"},
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+            return response
+
+        async def close(self):
+            closed.append(self)
+
+    config = resolve_env_config(
+        {
+            "taskset": {"id": "reverse-text"},
+            "interception": interception,
+            "agent": {
+                "harness": {"id": "null"},
+                "runtime": {"type": "subprocess"},
+                "max_turns": 1,
+            },
+        }
+    )
+    env = load_environment(config)
+    context = ModelContext(
+        "host-policy",
+        EvalClientConfig(base_url="http://127.0.0.1:1/v1"),
+        Sampling(max_tokens=8),
+    )
+    async with env.serving(client_factory=lambda config: HostClient()):
+        episode = await env.run_episode(next(iter(env.taskset.load())), context)
+    assert episode.ok, (
+        episode.errors,
+        [(t.errors, t.stop_condition) for t in episode.traces],
+    )
+    assert calls == [("host-policy", episode.traces[0].id)]
+    assert len(closed) == 1
+
+
 def pair(a: str, b: str, id: str, *extra_marks):
     marks = [getattr(mark, a.replace("-", "_")), getattr(mark, b.replace("-", "_"))]
     return pytest.param(a, b, marks=[*marks, *extra_marks], id=id)

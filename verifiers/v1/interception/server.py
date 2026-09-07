@@ -38,6 +38,7 @@ from pydantic_core import PydanticSerializationError, from_json, to_json
 
 from verifiers.v1 import graph
 from verifiers.v1.clients import Client, resolve_client
+from verifiers.v1.clients.client import ClientFactory
 from verifiers.v1.configs.client import BaseClientConfig
 from verifiers.v1.dialects import DIALECTS, Dialect
 from verifiers.v1.dialects.base import (
@@ -147,10 +148,12 @@ class InterceptionServer(Interception):
         config: InterceptionServerConfig | None = None,
         requires_tunnel: bool = False,
         state_service_secrets: Collection[str] = (),
+        client_factory: ClientFactory | None = None,
     ) -> None:
         super().__init__()
         self.sessions: dict[str, RolloutSession] = {}
         self.clients: dict[str, Client] = {}
+        self.client_factory = client_factory or resolve_client
         self.state_sessions: dict[str, RolloutSession] = {}
         self.state_routes: dict[str, RolloutSession] = {}
         self.state_service_secrets = frozenset(state_service_secrets)
@@ -176,7 +179,7 @@ class InterceptionServer(Interception):
         key = config.model_dump_json()
         client = self.clients.get(key)
         if client is None:
-            client = self.clients[key] = resolve_client(config)
+            client = self.clients[key] = self.client_factory(config)
             self.stack.push_async_callback(client.close)
         return client
 

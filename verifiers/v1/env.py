@@ -14,6 +14,7 @@ from typing import (
 
 from verifiers.v1.agent import Agent, Agents, _EpisodeAgent
 from verifiers.v1.clients import ModelContext
+from verifiers.v1.clients.client import ClientFactory
 from verifiers.v1.configs.agent import AgentConfig
 from verifiers.v1.configs.env import (
     EnvConfig,
@@ -351,9 +352,15 @@ class Env(ABC, Generic[ConfigT]):
         return episode
 
     @contextlib.asynccontextmanager
-    async def serving(self):
+    async def serving(self, *, client_factory: ClientFactory | None = None):
         """Hold the env-level serving resources for the duration of an eval; plan and
-        run slots inside. Torn down on exit (`teardown()`, then the framework's)."""
+        run slots inside. Torn down on exit (`teardown()`, then the framework's).
+
+        A runtime-only client factory can bind host-managed inference. Returned
+        clients are shared per config per server and closed by that server.
+        Adapters borrowing a model must release only their own resources in
+        close(); factories should return a fresh adapter for each call.
+        """
         async with self.shared_tools() as shared:
             interception = make_interception(
                 self.config.interception,
@@ -363,6 +370,7 @@ class Env(ABC, Generic[ConfigT]):
                     for server in shared.values()
                     if server.state_secret
                 ),
+                client_factory=client_factory,
             )
             async with interception:
                 self._shared_tools = shared
