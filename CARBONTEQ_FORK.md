@@ -1,12 +1,13 @@
-# CarbonTeq Verifiers fork
+# CarbonTeq Verifiers distribution
 
-Status: maintained CarbonTeq fork. Repository:
-`https://github.com/carbonteq-ai/verifiers`. The immutable implementation and
-consumer revisions are recorded below after publication.
+Status: independently maintained CarbonTeq distribution. Repository:
+`https://github.com/carbonteq-ai/verifiers`. Prime Intellect Verifiers remains
+an upstream source of reviewed changes, but upstream acceptance is not a release
+or support requirement for this distribution.
 
-Upstream: primeintellect-ai/verifiers, v0.3.1,
-`b2e4e8157783b2c0dffc7821044c87f29f1c3ccf`.
-Local branch: `codex/injected-policy-client`.
+Upstream synchronization base: primeintellect-ai/verifiers `main`, 71 commits
+after v0.3.1, `e3bcbcbe5c55297a07a5d1038e37c2408b4a3dbd`.
+Release branch: `codex/carbonteq-verifiers-latest`.
 
 ## Maintained delta
 
@@ -25,22 +26,32 @@ No algorithm, Posttrain package, or GPU-runtime dependency is introduced.
 
 ## Regression and compatibility
 
-Use Python 3.13 and the v0.3.1 upstream lock. The real local subprocess/null
+Use Python 3.13 and the selected upstream lock. The real local subprocess/null
 harness test `test_host_client_factory_runs_local_episode_and_closes_adapter`
 passes for server/static/elastic interception without external model credentials.
 
-    uv run pytest tests/v1/test_e2e.py -k host_client_factory -q
+    uv run --python 3.13 python -m pytest tests/v1/test_e2e.py -k host_client_factory -q
+    uv run --python 3.13 python -m pytest tests/v1 -q
 
-Consumer tests additionally exercise exact sampled-token preservation and
-AutomationBench tool execution. Consumer ownership and evidence are documented
-in Posttrain's `docs/tooling/verifiers/README.md`.
+The three injected-client cases and the current v1 suite pass; credentialed E2E
+cases skip when `PRIME_API_KEY` is absent. Nine focused Posttrain train/eval
+compatibility checks pass against the latest source, including exact
+sampled-token/log-probability preservation and AutomationBench tool execution.
+Twenty-seven AutomationBench environment tests pass after removing its optional
+OpenAI Agents schema dependency, which conflicts with Verifiers' MCP 2 runtime.
+Consumer ownership and evidence are documented in Posttrain's
+`docs/tooling/verifiers/README.md`.
 
-## Rebase and publication
+## Upstream synchronization and publication
 
 Upstream `main` at `e3bcbcbe5c55297a07a5d1038e37c2408b4a3dbd` still has no
-host-client injection seam. Before rebasing, check again for an equivalent
-upstream capability, run the three local integrations and the upstream
-client/interception regression suites, then build and clean-install the wheel.
+host-client injection seam. Periodically review upstream changes and port or
+merge them by behavior, retaining CarbonTeq-owned APIs when they remain useful.
+An upstream pull request may be opened when mutual reuse is valuable, but it is
+never a promotion gate. Before synchronizing, inventory every CarbonTeq delta,
+run fork and consumer compatibility suites, then build and clean-install the
+wheel. Publish only immutable CarbonTeq commits and move consumer pins only
+after qualification.
 
-Published implementation commit: pending.
+Published implementation commit: `b126760eadbbbbfff6eb7badca845925ee20a885`.
 Consumer revision: pending.
