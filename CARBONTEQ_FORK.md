@@ -33,6 +33,13 @@ when a training product versions a corrected template independently of the
 model repository; it keeps worker-side rendering token-identical without
 introducing Posttrain or task-specific logic into Verifiers.
 
+`EnvClient.run(..., request_id=...)` optionally preserves a caller-stable wire
+identity, and `EnvClient.cancel(request_id)` waits for the native server or pool
+to acknowledge whether that run was still active. The existing automatic
+best-effort cancel on coroutine cancellation remains a fallback. This lets a
+fixed-policy coordinator prove episode termination before changing weights
+without introducing trainer-specific identities or lifecycle code here.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
@@ -47,7 +54,8 @@ cases skip when `PRIME_API_KEY` is absent. Nine focused Posttrain train/eval
 compatibility checks pass against the latest source, including exact
 sampled-token/log-probability preservation and AutomationBench tool execution.
 The selected-template config round trip and renderer-cache isolation tests pass
-in `tests/v1/test_train_client.py`.
+in `tests/v1/test_train_client.py`. The caller-owned run identity and
+acknowledged cancellation contract passes in `tests/v1/test_e2e.py`.
 Twenty-seven AutomationBench environment tests pass after removing its optional
 OpenAI Agents schema dependency, which conflicts with Verifiers' MCP 2 runtime.
 Consumer ownership and evidence are documented in Posttrain's

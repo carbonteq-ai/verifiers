@@ -25,6 +25,7 @@ from verifiers.v1.serve.types import (
     BaseRequest,
     BaseResponse,
     CancelRequest,
+    CancelResponse,
     HealthRequest,
     HealthResponse,
     RunRequest,
@@ -73,11 +74,14 @@ class EnvClient:
         request: BaseRequest,
         response_type: type[ResponseT],
         timeout: float | None = None,
+        request_id: str | None = None,
     ) -> ResponseT:
         """Send a typed request and validate the reply into `response_type`. A
         `timeout` is only used for health polling — rollouts run untimed."""
         self._ensure_receiver()
-        request_id = uuid.uuid4().hex
+        request_id = request_id or uuid.uuid4().hex
+        if request_id in self._pending:
+            raise ValueError(f"duplicate active env-server request id {request_id!r}")
         future: asyncio.Future[bytes] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         payload = msgpack.packb(request.model_dump(mode="json"), use_bin_type=True)
@@ -164,6 +168,7 @@ class EnvClient:
         model: str,
         sampling: SamplingConfig,
         task_data: dict,
+        request_id: str | None = None,
     ) -> WireEpisode:
         """Run one rollout; return its episode record — flat traces (typed
         `Trace[WireTaskData]`) plus the shared stamp. The server takes the task
@@ -176,8 +181,20 @@ class EnvClient:
                 sampling=sampling,
             ),
             RunResponse,
+            request_id=request_id,
         )
+        assert response.episode is not None  # successful run responses always carry an episode
         return response.episode
+
+    async def cancel(self, request_id: str) -> bool:
+        """Request cancellation of one caller-identified run and await acknowledgment."""
+        if not request_id:
+            raise ValueError("run request_id cannot be empty")
+        response = await self._request(
+            CancelRequest(request_id=request_id),
+            CancelResponse,
+        )
+        return response.cancelled
 
     async def close(self) -> None:
         if self._receiver is not None:

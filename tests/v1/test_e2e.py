@@ -784,6 +784,75 @@ def test_env_client_close_drains_finished_cancels():
     )
 
 
+@pytest.mark.asyncio
+async def test_env_client_preserves_caller_run_identity_and_acknowledges_cancel():
+    import asyncio
+
+    import msgpack
+    import zmq
+    import zmq.asyncio
+
+    from verifiers.v1.configs.client import EvalClientConfig
+    from verifiers.v1.episode import WireEpisode
+    from verifiers.v1.serve.client import EnvClient
+    from verifiers.v1.serve.types import (
+        CancelRequest,
+        CancelResponse,
+        RunRequest,
+        RunResponse,
+    )
+    from verifiers.v1.types import SamplingConfig
+
+    context = zmq.asyncio.Context()
+    server = context.socket(zmq.ROUTER)
+    server.setsockopt(zmq.LINGER, 0)
+    server.bind("tcp://127.0.0.1:0")
+    client = EnvClient(server.getsockopt_string(zmq.LAST_ENDPOINT))
+    try:
+        running = asyncio.create_task(
+            client.run(
+                client=EvalClientConfig(base_url="http://127.0.0.1:1/v1"),
+                model="policy-model",
+                sampling=SamplingConfig(max_tokens=8),
+                task_data={"prompt": "test"},
+                request_id="collection-1:rollout-1",
+            )
+        )
+        identity, request_id, method, payload = await server.recv_multipart()
+        assert request_id == b"collection-1:rollout-1"
+        assert method == RunRequest.method.encode()
+        assert msgpack.unpackb(payload, raw=False)["task_data"] == {"prompt": "test"}
+        response = RunResponse(
+            episode=WireEpisode(
+                id="episode-1",
+                env={"name": "test"},
+                task={"type": "test", "data": {"prompt": "test"}},
+            )
+        )
+        await server.send_multipart(
+            [identity, request_id, msgpack.packb(response.model_dump(mode="json"), use_bin_type=True)]
+        )
+        episode = await running
+        assert episode.id == "episode-1"
+
+        cancelling = asyncio.create_task(client.cancel("collection-1:rollout-1"))
+        identity, cancel_id, method, payload = await server.recv_multipart()
+        assert method == CancelRequest.method.encode()
+        assert msgpack.unpackb(payload, raw=False) == {"request_id": "collection-1:rollout-1"}
+        await server.send_multipart(
+            [
+                identity,
+                cancel_id,
+                msgpack.packb(CancelResponse(cancelled=True).model_dump(), use_bin_type=True),
+            ]
+        )
+        assert await cancelling
+    finally:
+        await client.close()
+        server.close()
+        context.term()
+
+
 @pytest.mark.e2e
 async def test_replay_round_trip(run_v1, tmp_path):
     """eval -> replay -> replay-the-replay. Offline re-scoring must preserve the saved
