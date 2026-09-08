@@ -5,9 +5,53 @@ Status: independently maintained CarbonTeq distribution. Repository:
 an upstream source of reviewed changes, but upstream acceptance is not a release
 or support requirement for this distribution.
 
-Upstream synchronization base: primeintellect-ai/verifiers `main`, 71 commits
-after v0.3.1, `e3bcbcbe5c55297a07a5d1038e37c2408b4a3dbd`.
+Upstream synchronization base: primeintellect-ai/verifiers `main`,
+`27bbd216df0af719a43705866b2cf6139bcc95de` (verified live 2026-09-08).
 Release branch: `codex/carbonteq-verifiers-latest`.
+Expected remotes: `origin=https://github.com/carbonteq-ai/verifiers.git` and
+`upstream=https://github.com/PrimeIntellect-ai/verifiers.git`.
+
+The 2026-09-08 synchronization advances one upstream commit from the previous
+`e3bcbcbe` base. It restores direct Prime background-job polling in
+`verifiers/v1/runtimes/prime.py`; this is upstream behavior, not a CarbonTeq
+delta. Prime-RL main commit `04a61d3b` pins Verifiers `828488ff`, which is an
+ancestor of this base. Its asynchronous orchestrator uses Verifiers'
+consumer-stamped `TrainWorkInfo.policy: PolicySpan`; Verifiers deliberately
+does not own trainer policy versions or staleness decisions.
+
+### Async-training compatibility boundary
+
+Verifiers is compatible with multiple asynchronous trainers through evidence
+and lifecycle primitives; it is not the owner of their scheduling policy.
+`TrainWorkInfo.policy: PolicySpan` records the oldest and newest live policy
+versions spanned by an episode. Native traces retain exact sampled token IDs,
+sampling masks, and behavior log probabilities. Those facts are sufficient for
+a consumer to implement version rejection and importance-sampling correction.
+The consumer's bounded queue and request admission implement depth bounding.
+
+The current API supports these partial-rollout strategies:
+
+- batch/request barriers, where no update occurs until active generation is
+  complete;
+- soft request drain, where the inference adapter stops accepting new model
+  requests while existing requests finish, and an episode executing a tool
+  remains alive until its next model request is admitted;
+- acknowledged whole-episode or whole-group cancellation through caller-owned
+  run IDs, without converting cancellation into a fabricated low reward.
+
+The current `TrainClient` does not expose a partially completed assistant
+generation. Therefore abort-and-prefix-resume and explicit mid-generation
+save/resume are not yet generic Verifiers capabilities. A backend claiming one
+of those modes must provide a generation adapter that retains partial token
+IDs, aligned behavior log probabilities, sampling masks, and the same logical
+turn/session identity across resumption. A completed tool call is environment
+state and must never be replayed because weights changed. Mixed-weight
+per-forward continuation is also unsupported until a provider supplies an
+honest policy span and the consuming loss is qualified for that behavior.
+
+Version rejection, queue depth, cancellation policy, importance-ratio math,
+and weight transport remain trainer/orchestrator responsibilities. Do not add
+those policies to task, scorer, or environment configuration.
 
 ## Maintained delta
 
@@ -63,7 +107,7 @@ Consumer ownership and evidence are documented in Posttrain's
 
 ## Upstream synchronization and publication
 
-Upstream `main` at `e3bcbcbe5c55297a07a5d1038e37c2408b4a3dbd` still has no
+Upstream `main` at `27bbd216df0af719a43705866b2cf6139bcc95de` still has no
 host-client injection seam. Periodically review upstream changes and port or
 merge them by behavior, retaining CarbonTeq-owned APIs when they remain useful.
 An upstream pull request may be opened when mutual reuse is valuable, but it is
