@@ -77,6 +77,12 @@ class TrainClientConfig(BaseClientConfig):
     """Model the tokenizer/renderer pool is built for. Pin to the base model so a LoRA
     adapter name (served only for sampling) never drives tokenizer loading. Falls back to
     the per-request model when None."""
+    chat_template: str | None = None
+    """Exact selected chat template, when it differs from the tokenizer artifact.
+
+    The template is part of training provenance: workers must render the same token
+    sequence as the policy owner. ``None`` retains the tokenizer's bundled template.
+    """
     multiplex: int = Field(256, ge=1)
     """Rollouts that share one renderer (~75-95 MB each): the pool warms one and grows on
     demand, so N concurrent rollouts hold ~N/multiplex tokenizers. A renderer is only busy

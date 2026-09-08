@@ -229,16 +229,19 @@ class ElasticRendererPool:
         renderer_model: str,
         config: RendererConfig | None,
         *,
+        chat_template: str | None = None,
         chat_template_kwargs: Mapping[str, Any] | None = None,
         multiplex: int,
     ) -> None:
         self.renderer_model = renderer_model
         self.config = config
+        self.chat_template = chat_template
         self.chat_template_kwargs = chat_template_kwargs
         self.multiplex = multiplex
         self.key = (
             renderer_model,
             config.model_dump_json() if config is not None else None,
+            chat_template,
             json.dumps(dict(chat_template_kwargs), sort_keys=True)
             if chat_template_kwargs
             else None,
@@ -274,8 +277,11 @@ class ElasticRendererPool:
             from renderers.base import load_tokenizer
 
             def build():
+                tokenizer = load_tokenizer(self.renderer_model)
+                if self.chat_template is not None:
+                    tokenizer.chat_template = self.chat_template
                 return create_renderer(
-                    load_tokenizer(self.renderer_model),
+                    tokenizer,
                     self.config,
                     chat_template_kwargs=self.chat_template_kwargs,
                 )
@@ -318,6 +324,7 @@ class TrainClient(Client):
             ElasticRendererPool(
                 config.renderer_model_name,
                 config.renderer,
+                chat_template=config.chat_template,
                 multiplex=config.multiplex,
             ).warm()
 
@@ -367,6 +374,7 @@ class TrainClient(Client):
         pool = ElasticRendererPool(
             self.config.renderer_model_name or model,
             self.config.renderer,
+            chat_template=self.config.chat_template,
             chat_template_kwargs=chat_template_kwargs,
             multiplex=self.config.multiplex,
         )

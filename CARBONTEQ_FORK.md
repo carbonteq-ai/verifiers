@@ -24,6 +24,15 @@ Changed files: `verifiers/v1/env.py`, `clients/client.py`,
 `interception/server.py`, and existing `tests/v1/test_e2e.py`.
 No algorithm, Posttrain package, or GPU-runtime dependency is introduced.
 
+`TrainClientConfig.chat_template` optionally carries the exact selected Jinja
+template to native environment workers. `ElasticRendererPool` applies it after
+loading the tokenizer and includes it in the pool cache key, so two model
+contracts cannot accidentally share a renderer merely because they use the
+same base-model artifact. `None` preserves upstream behavior. This is required
+when a training product versions a corrected template independently of the
+model repository; it keeps worker-side rendering token-identical without
+introducing Posttrain or task-specific logic into Verifiers.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
@@ -37,6 +46,8 @@ The three injected-client cases and the current v1 suite pass; credentialed E2E
 cases skip when `PRIME_API_KEY` is absent. Nine focused Posttrain train/eval
 compatibility checks pass against the latest source, including exact
 sampled-token/log-probability preservation and AutomationBench tool execution.
+The selected-template config round trip and renderer-cache isolation tests pass
+in `tests/v1/test_train_client.py`.
 Twenty-seven AutomationBench environment tests pass after removing its optional
 OpenAI Agents schema dependency, which conflicts with Verifiers' MCP 2 runtime.
 Consumer ownership and evidence are documented in Posttrain's
