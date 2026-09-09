@@ -3,8 +3,22 @@ from types import SimpleNamespace
 import pytest
 from renderers import DefaultRendererConfig
 
+from verifiers.v1.clients.renderer_extensions import LFM2ToolParser
 from verifiers.v1.clients.train import ElasticRendererPool
 from verifiers.v1.configs.client import TrainClientConfig
+
+
+class LFMTokenizer:
+    unk_token_id = -1
+
+    def convert_tokens_to_ids(self, token):
+        return {"<|tool_call_start|>": 100, "<|tool_call_end|>": 101}.get(token, -1)
+
+    def decode(self, token_ids, *, skip_special_tokens):
+        assert skip_special_tokens is False
+        if token_ids == [1]:
+            return "[salesforce_note_create(parent_id='001001', title='Q1')]"
+        return "content"
 
 
 def test_train_client_config_serializes_selected_chat_template():
@@ -17,6 +31,17 @@ def test_train_client_config_serializes_selected_chat_template():
     restored = TrainClientConfig.model_validate_json(config.model_dump_json())
 
     assert restored.chat_template == "selected {{ messages }}"
+
+
+def test_lfm2_parser_recovers_pythonic_tool_call_without_executing_code():
+    content, calls = LFM2ToolParser(LFMTokenizer()).extract([9, 100, 1, 101])
+
+    assert content == [9]
+    assert len(calls) == 1
+    assert calls[0].name == "salesforce_note_create"
+    assert calls[0].arguments == {"parent_id": "001001", "title": "Q1"}
+    assert calls[0].status.value == "ok"
+    assert calls[0].token_span == (1, 4)
 
 
 @pytest.mark.asyncio

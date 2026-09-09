@@ -40,11 +40,18 @@ class CancelResponse(BaseResponse):
 
 
 class RunRequest(BaseRequest):
-    """One env-rollout, shipping the task itself: `task_data` is the dumped
-    `TaskData` the server validates into the taskset's declared type."""
+    """One env-rollout, shipping the task itself.
+
+    ``task_data`` and ``task_config`` are the dumped values the server validates
+    into the taskset's declared types.  A taskset may derive per-task config while
+    loading (for example, a task-specific tool allowlist), so data alone is not a
+    lossless task representation.  ``task_config`` remains optional for older
+    clients whose tasks all use the environment's static config.
+    """
 
     method: ClassVar[str] = "run"
     task_data: dict
+    task_config: dict | None = None
     client: ClientConfig
     model: str
     sampling: SamplingConfig

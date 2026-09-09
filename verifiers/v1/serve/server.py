@@ -76,14 +76,18 @@ class EnvServer:
             # of a spurious multiprocessing traceback, matching serve_env's own handling.
             pass
 
-    def _build_task(self, task_data: dict) -> Task:
-        """Rebuild a request's task from its wire data: validate into the taskset's
-        declared `TaskData` type and wrap it in the declared `Task` with the config's
-        task subtree — the same construction the taskset's own `load()` performs. The
-        client owns the taskset; this server never `load()`s data, so pool workers
-        don't each pull the dataset."""
+    def _build_task(self, task_data: dict, task_config: dict | None = None) -> Task:
+        """Rebuild one request's complete task without loading the dataset.
+
+        The per-instance config is authoritative when supplied because tasksets
+        may derive it from each row.  Legacy clients that omit it retain the
+        environment's static task config.
+        """
         data = self.data_cls.model_validate(task_data)
-        return self.task_cls(data, self.env.config.taskset.task)
+        config = self.env.config.taskset.task
+        if task_config is not None:
+            config = self.task_cls.config_type().model_validate(task_config)
+        return self.task_cls(data, config)
 
     def _context(
         self, client_config: ClientConfig, model: str, sampling: SamplingConfig
@@ -95,7 +99,7 @@ class EnvServer:
 
     async def _run(self, req: RunRequest) -> RunResponse:
         ctx = self._context(req.client, req.model, req.sampling)
-        (slot,) = self.env.slots(self._build_task(req.task_data))
+        (slot,) = self.env.slots(self._build_task(req.task_data, req.task_config))
         # The gate spans requests: `--max-concurrent` bounds this worker's episodes
         # in flight the same way the in-process eval's semaphore does.
         episode = await self.env.run_slot(slot, ctx, self._gate)

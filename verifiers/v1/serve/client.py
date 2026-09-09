@@ -169,13 +169,15 @@ class EnvClient:
         sampling: SamplingConfig,
         task_data: dict,
         request_id: str | None = None,
+        task_config: dict | None = None,
     ) -> WireEpisode:
         """Run one rollout; return its episode record — flat traces (typed
         `Trace[WireTaskData]`) plus the shared stamp. The server takes the task
-        itself (`task_data`, its dumped `TaskData`)."""
+        itself as its dumped data plus optional per-instance config."""
         response = await self._request(
             RunRequest(
                 task_data=task_data,
+                task_config=task_config,
                 client=client,
                 model=model,
                 sampling=sampling,

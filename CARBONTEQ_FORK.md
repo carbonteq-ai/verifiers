@@ -55,6 +55,23 @@ those policies to task, scorer, or environment configuration.
 
 ## Maintained delta
 
+The native environment-server wire contract carries both task data and the
+task's validated per-instance config. Tasksets can derive row-specific config
+while loading—for example, an allowlist of tools selected for one task—and a
+worker must not silently replace that config with the catalog default when it
+reconstructs the task. Older clients may omit `task_config` and retain the
+static-config behavior. The CLI and CarbonTeq Posttrain caller send the complete
+task. Regression coverage proves both the derived-config and legacy paths.
+
+The training client registers an `lfm2` structured-output parser for the
+default renderer. It recognizes LFM2's special-token-delimited Python call
+list using `ast.literal_eval`; sampled text is never executed. Posttrain opts
+into this parser through its versioned LFM conversation contract. This is a
+generic model-protocol compatibility seam and does not introduce task,
+environment, reward, or trainer-algorithm ownership into Verifiers. The parser
+should move to the upstream `renderers` package when that package accepts LFM2
+as a native protocol.
+
 `Env.serving(client_factory=...)` accepts an optional host-owned client factory
 and threads it through server, static-pool and elastic-pool interception.
 The default remains the upstream client resolver. A host can supply an adapter

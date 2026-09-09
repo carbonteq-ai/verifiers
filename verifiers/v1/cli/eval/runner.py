@@ -119,6 +119,7 @@ async def _server(
                         model=config.model,
                         sampling=config.sampling,
                         task_data=slot.task.data.model_dump(mode="json"),
+                        task_config=slot.task.config.model_dump(mode="json"),
                     )
                 slot.traces = list(episode.traces)
                 slot.episode = cast(Episode, episode)

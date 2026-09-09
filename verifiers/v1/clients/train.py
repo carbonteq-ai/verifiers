@@ -15,6 +15,7 @@ from renderers.base import ToolCallParseStatus, is_multimodal
 
 from verifiers.v1.clients.base import build_async_openai
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
+from verifiers.v1.clients.renderer_extensions import register_renderer_extensions
 from verifiers.v1.configs.client import TrainClientConfig
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
 from verifiers.v1.dialects.chat import message_to_wire
@@ -316,6 +317,7 @@ class TrainClient(Client):
     `ElasticRendererPool`."""
 
     def __init__(self, config: TrainClientConfig) -> None:
+        register_renderer_extensions()
         self.config = config
         self.client = build_async_openai(config)
         # The per-request model is only known at call time; a config that pins the renderer
