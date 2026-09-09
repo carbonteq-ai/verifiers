@@ -65,12 +65,14 @@ task. Regression coverage proves both the derived-config and legacy paths.
 
 The training client registers an `lfm2` structured-output parser for the
 default renderer. It recognizes LFM2's special-token-delimited Python call
-list using `ast.literal_eval`; sampled text is never executed. Posttrain opts
-into this parser through its versioned LFM conversation contract. This is a
-generic model-protocol compatibility seam and does not introduce task,
-environment, reward, or trainer-algorithm ownership into Verifiers. The parser
-should move to the upstream `renderers` package when that package accepts LFM2
-as a native protocol.
+list using `ast.literal_eval`; sampled text is never executed. Its incremental
+tool-cycle bridge also preserves the exact sampled token prefix when vLLM has
+stripped the stop token, appending only the protocol close/newline scaffold and
+new tool observations. Posttrain opts into this behavior through its versioned
+LFM conversation contract. This is a generic model-protocol compatibility seam
+and does not introduce task, environment, reward, or trainer-algorithm
+ownership into Verifiers. The parser and bridge should move to the upstream
+`renderers` package when that package accepts LFM2 as a native protocol.
 
 `Env.serving(client_factory=...)` accepts an optional host-owned client factory
 and threads it through server, static-pool and elastic-pool interception.

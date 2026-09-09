@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 from renderers import DefaultRendererConfig
 
-from verifiers.v1.clients.renderer_extensions import LFM2ToolParser
+from verifiers.v1.clients.renderer_extensions import (
+    LFM2ToolParser,
+    bridge_lfm2_tool_cycle,
+)
 from verifiers.v1.clients.train import ElasticRendererPool
 from verifiers.v1.configs.client import TrainClientConfig
 
@@ -42,6 +45,46 @@ def test_lfm2_parser_recovers_pythonic_tool_call_without_executing_code():
     assert calls[0].arguments == {"parent_id": "001001", "title": "Q1"}
     assert calls[0].status.value == "ok"
     assert calls[0].token_span == (1, 4)
+
+
+def test_lfm2_bridge_restores_template_close_after_stripped_stop_token():
+    class Tokenizer:
+        bos_token_id = 5
+        eos_token_id = 7
+
+        @staticmethod
+        def encode(text, *, add_special_tokens):
+            assert text == "\n"
+            assert add_special_tokens is False
+            return [8]
+
+    class Renderer:
+        _tokenizer = Tokenizer()
+
+        @staticmethod
+        def render(messages, *, tools, add_generation_prompt):
+            assert messages == [{"role": "tool", "content": "created"}]
+            assert tools is None
+            assert add_generation_prompt is True
+            from renderers import RenderedTokens
+
+            return RenderedTokens(
+                token_ids=[5, 9, 10],
+                message_indices=[-1, 0, -1],
+                message_roles=["tool"],
+                message_tool_names=[None],
+            )
+
+    bridged = bridge_lfm2_tool_cycle(
+        Renderer(),
+        [1, 2],
+        [3, 4],
+        [{"role": "tool", "content": "created"}],
+    )
+
+    assert bridged is not None
+    assert bridged.token_ids == [1, 2, 3, 4, 7, 8, 9, 10]
+    assert bridged.message_indices == [-1, -1, -1, -1, -1, -1, 0, -1]
 
 
 @pytest.mark.asyncio

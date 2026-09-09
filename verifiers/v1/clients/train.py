@@ -15,7 +15,10 @@ from renderers.base import ToolCallParseStatus, is_multimodal
 
 from verifiers.v1.clients.base import build_async_openai
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
-from verifiers.v1.clients.renderer_extensions import register_renderer_extensions
+from verifiers.v1.clients.renderer_extensions import (
+    bridge_lfm2_tool_cycle,
+    register_renderer_extensions,
+)
 from verifiers.v1.configs.client import TrainClientConfig
 from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
 from verifiers.v1.dialects.chat import message_to_wire
@@ -407,6 +410,18 @@ class TrainClient(Client):
                     )
 
                 bridged = await slot.run(bridge)
+                if (
+                    bridged is None
+                    and getattr(self.config.renderer, "tool_parser", None) == "lfm2"
+                ):
+                    bridged = await slot.run(
+                        lambda: bridge_lfm2_tool_cycle(
+                            renderer,
+                            previous_prompt_ids,
+                            previous_completion_ids,
+                            wire_messages,
+                        )
+                    )
                 if bridged is not None:
                     prompt_ids = bridged.token_ids
                     multi_modal_data = bridged.multi_modal_data
