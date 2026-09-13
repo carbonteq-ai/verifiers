@@ -84,6 +84,14 @@ best-effort cancel on coroutine cancellation remains a fallback. This lets a
 fixed-policy coordinator prove episode termination before changing weights
 without introducing trainer-specific identities or lifecycle code here.
 
+`Taskset.select(keys)` and `EvalConfig.task_keys` allow an evaluation caller to
+dispatch an exact ordered set of stable task identities. Selection materializes
+only finite tasksets and rejects missing requested keys, duplicate requests,
+and duplicate source identities before any episode starts. The ordinary
+shuffle/head path remains unchanged when `task_keys` is absent. This generic
+seam lets callers reuse a reviewed evaluation manifest across model subjects
+without introducing Posttrain selection policy into Verifiers.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
@@ -100,6 +108,9 @@ sampled-token/log-probability preservation and AutomationBench tool execution.
 The selected-template config round trip and renderer-cache isolation tests pass
 in `tests/v1/test_train_client.py`. The caller-owned run identity and
 acknowledged cancellation contract passes in `tests/v1/test_e2e.py`.
+Exact evaluation task selection passes `tests/v1/test_taskset.py` and
+`tests/v1/test_eval_task_selection.py`; the complete v1 suite remains the
+publication gate.
 Twenty-seven AutomationBench environment tests pass after removing its optional
 OpenAI Agents schema dependency, which conflicts with Verifiers' MCP 2 runtime.
 Consumer ownership and evidence are documented in Posttrain's

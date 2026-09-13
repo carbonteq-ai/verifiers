@@ -148,9 +148,12 @@ async def run_eval(config: EvalConfig) -> list[Episode]:
         raise ValueError(
             f"{type(taskset).__name__} is infinite - bound the run with -n"
         )
-    selected = taskset.shuffle() if config.shuffle else taskset
-    if config.num_tasks is not None:
-        selected = selected.head(config.num_tasks)
+    if config.task_keys is not None:
+        selected = taskset.select(config.task_keys)
+    else:
+        selected = taskset.shuffle() if config.shuffle else taskset
+        if config.num_tasks is not None:
+            selected = selected.head(config.num_tasks)
     tasks = list(selected)
     out = output_path(config)
     # One (task, rollouts-to-run) pair per selected task; resume shrinks the counts.

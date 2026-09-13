@@ -79,6 +79,8 @@ class EvalConfig(BaseConfig):
         validation_alias=AliasChoices("batch_size", "num_examples", "num_tasks", "n"),
     )
     """How many tasks to evaluate (None = all)."""
+    task_keys: list[str] | None = None
+    """Exact ordered task identities to evaluate instead of shuffle/head selection."""
     num_rollouts: int = Field(
         1,
         ge=1,
@@ -130,6 +132,15 @@ class EvalConfig(BaseConfig):
 
     @model_validator(mode="after")
     def auto_setup_run_name(self):
+        if self.task_keys is not None:
+            if not self.task_keys:
+                raise ValueError("task_keys cannot be empty")
+            if len(self.task_keys) != len(set(self.task_keys)):
+                raise ValueError("task_keys must be unique")
+            if self.shuffle:
+                raise ValueError("task_keys cannot be combined with shuffle")
+            if self.num_tasks is not None and self.num_tasks != len(self.task_keys):
+                raise ValueError("num_tasks must be unset or equal len(task_keys)")
         if self.run.name is None:
             self.run.name = default_run_name(self.env, self.model)
         if self.run.dir is None:
