@@ -89,3 +89,36 @@ def test_views_do_not_mutate_the_base_taskset() -> None:
     view = taskset.head(3)
     assert view.INFINITE is False and taskset.INFINITE is True
     assert idxs(taskset.head(2)) == [0, 1]  # base iterates untransformed
+
+
+def test_select_returns_exact_keys_in_requested_order() -> None:
+    taskset = FiniteTaskset(vf.TasksetConfig())
+    tasks = list(taskset)
+    selected = list(taskset.select([tasks[7].key, tasks[2].key]))
+    assert idxs(selected) == [7, 2]
+
+
+def test_select_rejects_missing_requested_and_duplicate_source_keys() -> None:
+    taskset = FiniteTaskset(vf.TasksetConfig())
+    with pytest.raises(ValueError, match="does not contain requested"):
+        list(taskset.select(["missing-key"]))
+    with pytest.raises(ValueError, match="selection must be unique"):
+        taskset.select(["same", "same"])
+
+    class DuplicateKeyTask(CountTask):
+        @property
+        def key(self) -> str:
+            return "duplicate"
+
+    class DuplicateKeyTaskset(vf.Taskset[DuplicateKeyTask, vf.TasksetConfig]):
+        def load(self):
+            for i in range(2):
+                yield DuplicateKeyTask(vf.TaskData(idx=i, prompt=f"task {i}"))
+
+    with pytest.raises(ValueError, match="taskset contains duplicate"):
+        list(DuplicateKeyTaskset(vf.TasksetConfig()).select(["duplicate"]))
+
+
+def test_select_rejects_infinite_tasksets() -> None:
+    with pytest.raises(ValueError, match="infinite"):
+        InfiniteTaskset(vf.TasksetConfig()).select(["task"])

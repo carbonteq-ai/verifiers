@@ -94,6 +94,47 @@ class Taskset(ABC, Generic[TaskT, TasksetConfigT]):
 
         return self.view(shuffled)
 
+    def select(self, keys: Iterable[str]) -> Self:
+        """Return a finite view containing exactly the requested task keys.
+
+        Requested order is preserved. Selection materializes a finite taskset so
+        missing or duplicate source keys fail before any episode is dispatched.
+        """
+        if self.INFINITE:
+            raise ValueError(
+                f"{type(self).__name__} is infinite - cannot select task keys"
+            )
+        requested = tuple(keys)
+        if not requested:
+            raise ValueError("task key selection cannot be empty")
+        if len(requested) != len(set(requested)):
+            raise ValueError("task key selection must be unique")
+
+        def selected(tasks: Iterator[TaskT]) -> Iterator[TaskT]:
+            by_key: dict[str, TaskT] = {}
+            duplicates: set[str] = set()
+            for task in tasks:
+                if task.key in by_key:
+                    duplicates.add(task.key)
+                else:
+                    by_key[task.key] = task
+            if duplicates:
+                raise ValueError(
+                    "taskset contains duplicate task keys: "
+                    + ", ".join(sorted(duplicates))
+                )
+            missing = [key for key in requested if key not in by_key]
+            if missing:
+                raise ValueError(
+                    "taskset does not contain requested task keys: "
+                    + ", ".join(missing)
+                )
+            return iter(by_key[key] for key in requested)
+
+        view = self.view(selected)
+        view.INFINITE = False
+        return view
+
     @classmethod
     def task_type(cls) -> type[Task]:
         return concrete_type(cls, Task, origin=Taskset) or Task
