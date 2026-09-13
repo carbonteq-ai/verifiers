@@ -92,6 +92,12 @@ shuffle/head path remains unchanged when `task_keys` is absent. This generic
 seam lets callers reuse a reviewed evaluation manifest across model subjects
 without introducing Posttrain selection policy into Verifiers.
 
+`EvalRunInfo.repetition_index` and the corresponding `RunSlot` field retain the
+planned zero-based repetition identity on each standalone evaluation episode.
+The eval runner stamps the identity before persisting the episode, so concurrent
+completion order does not become an implicit repetition identifier. The field
+is optional for compatibility with historical episode records.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
