@@ -34,7 +34,7 @@ from verifiers.v1.episode import Episode, EvalRunInfo
 logger = logging.getLogger(__name__)
 
 RunSlotFn = Callable[[RunSlot], Awaitable[Episode]]
-OnComplete = Callable[[Episode], Awaitable[None]]
+OnComplete = Callable[[RunSlot, Episode], Awaitable[None]]
 
 
 @contextlib.asynccontextmanager
@@ -51,7 +51,12 @@ async def _in_process(
     )
 
     async def run(slot: RunSlot) -> Episode:
-        return await env.run_slot(slot, ctx, semaphore, on_complete)
+        return await env.run_slot(
+            slot,
+            ctx,
+            semaphore,
+            lambda episode: on_complete(slot, episode),
+        )
 
     async with env.serving():
         yield run
@@ -123,7 +128,7 @@ async def _server(
                 slot.traces = list(episode.traces)
                 slot.episode = cast(Episode, episode)
                 slot.done = True
-                await on_complete(cast(Episode, episode))
+                await on_complete(slot, cast(Episode, episode))
                 return cast(Episode, episode)
 
             yield run
@@ -207,8 +212,14 @@ async def run_eval(config: EvalConfig) -> list[Episode]:
     )
     write_lock = asyncio.Lock()
 
-    async def on_complete(episode: Episode) -> None:
-        episode.record_run(EvalRunInfo(id=config.run.id, name=config.run.name))
+    async def on_complete(slot: RunSlot, episode: Episode) -> None:
+        episode.record_run(
+            EvalRunInfo(
+                id=config.run.id,
+                name=config.run.name,
+                repetition_index=slot.repetition_index,
+            )
+        )
         await append_episode(out, episode, write_lock)
 
     backend = (
@@ -219,15 +230,12 @@ async def run_eval(config: EvalConfig) -> list[Episode]:
     async with backend as run_slot:
         # The display slots: in-process ones are the env's own (it fills their live
         # traces); a served rollout's is a client-side stand-in its worker never sees.
-        planned = [
-            slot
-            for task, n in plan
-            for slot in (
-                env.slots(task, n)
-                if env is not None
-                else [RunSlot(task) for _ in range(n)]
-            )
-        ]
+        planned = []
+        for task, n in plan:
+            task_slots = env.slots(task, n) if env is not None else [RunSlot(task) for _ in range(n)]
+            for repetition_index, slot in enumerate(task_slots):
+                slot.repetition_index = repetition_index
+                planned.append(slot)
         slots = [RunSlot.finished(episode) for episode in finished] + planned
         push_state = None
         if config.push and config.rich is not None:

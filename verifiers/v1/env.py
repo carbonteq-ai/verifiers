@@ -60,6 +60,8 @@ class RunSlot:
     episode: Episode | None = None
     done: bool = False
     started: float | None = None
+    repetition_index: int | None = None
+    """Zero-based identity of this planned repetition when a runner assigns one."""
 
     @classmethod
     def finished(cls, episode: Episode) -> "RunSlot":

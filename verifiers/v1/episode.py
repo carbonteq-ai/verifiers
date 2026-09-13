@@ -79,6 +79,8 @@ class EvalRunInfo(BaseModel):
     type: Literal["eval"] = "eval"
     id: str
     name: str | None = None
+    repetition_index: int | None = Field(default=None, ge=0)
+    """Stable slot of this task repetition within the standalone evaluation."""
 
 
 RunInfo = Annotated[TrainRunInfo | EvalRunInfo, Field(discriminator="type")]
