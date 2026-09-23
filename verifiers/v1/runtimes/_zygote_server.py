@@ -31,6 +31,7 @@ import threading
 import traceback
 
 _HEADER = struct.Struct(">Q")
+RETIRED = "retired: a Python thread is running in the zygote"
 
 
 def _read_request(conn):
@@ -218,6 +219,7 @@ def main():
     selector.register(listener, selectors.EVENT_READ, "accept")
     selector.register(0, selectors.EVENT_READ, "control")
     selector.register(wake_r, selectors.EVENT_READ, "wake")
+    seen_modules = set(preload)
     running = {}  # pid -> connection awaiting the exit report
     reported = {}  # connection -> pid exited but not yet reaped
     abandoned = set()  # pids whose client went away before they exited
@@ -228,6 +230,11 @@ def main():
     print(
         json.dumps({"ready": True, "failed": failed, "os_threads": tasks}), flush=True
     )
+    # Output from later imports must not reach the client's ready pipe, nor sit
+    # in a buffer a forked child would inherit and flush into its own stdout.
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 1)
+    os.close(devnull)
 
     def send(conn, message):
         try:
@@ -280,10 +287,28 @@ def main():
                     send(conn, {"error": repr(exc)})
                     conn.close()
                     continue
+                # A `-m` program's module is imported here on first use, so
+                # later forks of it start warm without naming it in `preload`.
+                argv = request["argv"]
+                if argv[1:2] == ["-m"] and argv[2] not in seen_modules:
+                    seen_modules.add(argv[2])
+                    with contextlib.suppress(BaseException):
+                        importlib.import_module(argv[2])
+                if threading.active_count() > 1:
+                    # An import started a Python thread: forking is no longer
+                    # safe, so this zygote retires and callers exec instead.
+                    send(conn, {"error": RETIRED})
+                    conn.close()
+                    for fd in fds:
+                        os.close(fd)
+                    continue
                 close_fds = [listener.fileno(), wake_r, wake_w, conn.fileno()]
                 close_fds.append(selector.fileno())
                 close_fds += [c.fileno() for c in running.values() if c is not None]
                 close_fds += [c.fileno() for c in reported]
+                for stream in (sys.stdout, sys.stderr):
+                    with contextlib.suppress(OSError, ValueError):
+                        stream.flush()
                 started_r, started_w = os.pipe()
                 close_fds.append(started_r)
                 pid = os.fork()

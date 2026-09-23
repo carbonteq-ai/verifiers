@@ -204,3 +204,27 @@ async def test_uv_script_programs_fork_from_their_environment(fork_server):
         assert seen["preloaded"] is fork_server
     finally:
         await runtime.teardown()
+
+
+@pytest.mark.parametrize("fork_server", [False, True])
+async def test_module_programs_are_learned_by_the_zygote(
+    fork_server, tmp_path, monkeypatch
+):
+    package = tmp_path / "learned_pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("")
+    (package / "tool.py").write_text(
+        "import json, sys\n"
+        "print(json.dumps({'warm': 'learned_pkg.tool' in sys.modules, 'name': __name__}))\n"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(tmp_path))
+    runtime = await _runtime(fork_server)
+    try:
+        for _ in range(2):
+            result = await runtime.run([sys.executable, "-m", "learned_pkg.tool"], {})
+            assert result.exit_code == 0, result.stderr
+            seen = json.loads(result.stdout)
+            # Imported once in the zygote, then run fresh as __main__ per fork.
+            assert seen == {"warm": fork_server, "name": "__main__"}
+    finally:
+        await runtime.teardown()

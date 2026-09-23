@@ -127,8 +127,11 @@ each `python script|-m module|-c code` program the runtime starts on that
 interpreter, with the caller's session, working directory, environment and
 stdio. Prepared uv script environments started through the runtime's own
 activation wrapper (`UV_ACTIVATE_ARGV`) fork from a zygote for that
-environment's interpreter, with the wrapper's variables applied; anything
-else, or any fork-server failure, falls back to exec. The pid
+environment's interpreter, with the wrapper's variables applied. A `-m`
+program's module is imported into the zygote on first use, so tool servers
+start warm without being named in `preload`; if any import leaves a Python
+thread running, the zygote retires. Anything else, or any fork-server
+failure, falls back to exec. The pid
 is reported only after the child's `setsid()` and the child is reaped only
 after the caller has read its exit status, so process-group signals never reach
 the zygote or a reused pid. Separately, a local server's port file is polled

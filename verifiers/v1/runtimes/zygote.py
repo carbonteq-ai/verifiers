@@ -151,6 +151,7 @@ class Zygote:
         self.python = python
         self.preload = preload
         self.startup_vars = _startup_vars(env)
+        self._retired = False
         self._dir = tempfile.mkdtemp(prefix="vf-zygote-")
         self.socket_path = os.path.join(self._dir, f"{uuid.uuid4().hex[:8]}.sock")
         self._process = subprocess.Popen(
@@ -178,7 +179,8 @@ class Zygote:
 
     def accepts(self, argv: list[str], env: dict[str, str]) -> bool:
         return (
-            self._process.poll() is None
+            not self._retired
+            and self._process.poll() is None
             and eligible(argv, self.python)
             and _startup_vars(env) == self.startup_vars
         )
@@ -229,6 +231,8 @@ class Zygote:
             reply = json.loads(await reader.readline() or b'{"error": "zygote closed"}')
             if "error" in reply:
                 writer.close()
+                if str(reply["error"]).startswith("retired"):
+                    self._retired = True
                 raise RuntimeError(reply["error"])
             stdin_w = (
                 await _write_pipe(parent_ends[0])
