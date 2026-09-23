@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shutil
 import sys
 
 import pytest
@@ -167,3 +168,39 @@ def test_same_interpreter_requires_the_same_venv(tmp_path):
     assert not zygote.same_interpreter(b, a)  # same base binary, other venv
     assert zygote.eligible([a3, "-m", "x"], a)
     assert not zygote.eligible([a, "-u", "x.py"], a)
+
+
+UV_PROBE = """# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+import json, os, sys
+print(json.dumps({
+    "executable": sys.executable,
+    "venv": os.environ.get("VIRTUAL_ENV"),
+    "path_head": os.environ["PATH"].split(os.pathsep)[0],
+    "depth": os.environ.get("UV_RUN_RECURSION_DEPTH"),
+    "argv": sys.argv[1:],
+    "preloaded": "colorsys" in sys.modules,
+}))
+"""
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="needs uv")
+@pytest.mark.parametrize("fork_server", [False, True])
+async def test_uv_script_programs_fork_from_their_environment(fork_server):
+    runtime = await _runtime(fork_server)
+    try:
+        argv = await runtime.prepare_uv_script(UV_PROBE)
+        result = await runtime.run([*argv, "x"], {})
+        assert result.exit_code == 0, result.stderr
+        seen = json.loads(result.stdout.splitlines()[0])
+        venv = argv[4]
+        assert seen["venv"] == venv
+        assert seen["path_head"] == f"{venv}/bin"
+        assert seen["depth"] == "1"
+        assert seen["argv"] == ["x"]
+        assert seen["executable"].startswith(venv)
+        assert seen["preloaded"] is fork_server
+    finally:
+        await runtime.teardown()

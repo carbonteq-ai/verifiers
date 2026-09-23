@@ -18,6 +18,7 @@ from pydantic_config import BaseConfig
 from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes import zygote
 from verifiers.v1.runtimes.base import (
+    UV_ACTIVATE_ARGV,
     BaseRuntimeInfo,
     ProgramResult,
     Runtime,
@@ -140,15 +141,46 @@ class SubprocessRuntime(Runtime):
     def _host_env(self) -> dict[str, str]:
         return {k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()}
 
+    def _fork_candidate(
+        self, argv: list[str], env: dict[str, str]
+    ) -> tuple[str, list[str], dict[str, str]] | None:
+        """The interpreter, argv and env a fork would run, or None to exec.
+
+        Programs on this worker's interpreter qualify, as do prepared uv script
+        environments started through `UV_ACTIVATE_ARGV`, whose environment
+        changes are applied here exactly as the wrapper's shell would."""
+        if tuple(argv[:4]) == UV_ACTIVATE_ARGV and len(argv) >= 7:
+            venv, argv = argv[4], argv[5:]
+            if argv[0] not in self._uv_interpreters.values():
+                return None
+            home = env.get("HOME", "")
+            env = {
+                **env,
+                "VIRTUAL_ENV": venv,
+                "PATH": f"{venv}/bin:{home}/.local/bin:{env.get('PATH', '')}",
+                "UV_INSTALL_DIR": f"{home}/.local/bin",
+                "UV_RUN_RECURSION_DEPTH": "1",
+            }
+            python = argv[0]
+        else:
+            python = sys.executable
+        return (python, argv, env) if zygote.eligible(argv, python) else None
+
     async def _zygote_for(
         self, argv: list[str], env: dict[str, str]
-    ) -> zygote.Zygote | None:
-        if not self.config.fork_server or not zygote.eligible(argv, sys.executable):
+    ) -> tuple[zygote.Zygote, list[str], dict[str, str]] | None:
+        if not self.config.fork_server:
             return None
+        candidate = self._fork_candidate(argv, env)
+        if candidate is None:
+            return None
+        python, argv, env = candidate
         server = await asyncio.to_thread(
-            zygote.get_zygote, sys.executable, self.config.preload, self._host_env()
+            zygote.get_zygote, python, self.config.preload, self._host_env()
         )
-        return server if server is not None and server.accepts(argv, env) else None
+        if server is None or not server.accepts(argv, env):
+            return None
+        return server, argv, env
 
     async def _spawn(
         self,
@@ -165,13 +197,14 @@ class SubprocessRuntime(Runtime):
         PIPE, STDOUT (stderr only), an open file, or None to inherit."""
         full_env = self._host_env()
         full_env.update(self.process_env(env))
-        server = await self._zygote_for(argv, full_env)
+        fork = await self._zygote_for(argv, full_env)
         # A fork needs a descriptor per stream (None asks it for a new pipe); a
         # stderr merged into a new stdout pipe is left to exec.
         merged_into_pipe = (
             stderr == asyncio.subprocess.STDOUT and stdout == asyncio.subprocess.PIPE
         )
-        if server is not None and not merged_into_pipe:
+        if fork is not None and not merged_into_pipe:
+            server, fork_argv, fork_env = fork
             in_fd = _child_fd(stdin, 0)
             out_fd = _child_fd(stdout, 1)
             err_fd = (
@@ -179,8 +212,8 @@ class SubprocessRuntime(Runtime):
             )
             try:
                 return await server.spawn(
-                    argv,
-                    full_env,
+                    fork_argv,
+                    fork_env,
                     str(self.workdir),
                     stdin=in_fd,
                     stdout=out_fd,

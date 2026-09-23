@@ -125,7 +125,10 @@ variables so one setting also reaches tool servers' own runtimes). One warm
 interpreter per Python executable imports the listed modules once and forks
 each `python script|-m module|-c code` program the runtime starts on that
 interpreter, with the caller's session, working directory, environment and
-stdio; anything else, or any fork-server failure, falls back to exec. The pid
+stdio. Prepared uv script environments started through the runtime's own
+activation wrapper (`UV_ACTIVATE_ARGV`) fork from a zygote for that
+environment's interpreter, with the wrapper's variables applied; anything
+else, or any fork-server failure, falls back to exec. The pid
 is reported only after the child's `setsid()` and the child is reaped only
 after the caller has read its exit status, so process-group signals never reach
 the zygote or a reused pid. Separately, a local server's port file is polled

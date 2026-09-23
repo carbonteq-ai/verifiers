@@ -48,6 +48,15 @@ _ENSURE_UV = (
 # at the runtime's public URL.
 SERVICE_PORT = 8000
 
+# `sh -c UV_ACTIVATE <venv> <interpreter> <script...>` activates a prepared script
+# environment and execs the interpreter; runtimes may recognize it verbatim.
+UV_ACTIVATE_COMMAND = (
+    'export VIRTUAL_ENV="$1" PATH="${1}/bin:$HOME/.local/bin:$PATH" '
+    'UV_INSTALL_DIR="$HOME/.local/bin" UV_RUN_RECURSION_DEPTH=1; '
+    'shift; exec "$@"'
+)
+UV_ACTIVATE_ARGV = ("sh", "-c", UV_ACTIVATE_COMMAND, "uv-script")
+
 
 @dataclass(frozen=True)
 class ProgramResult:
@@ -284,20 +293,7 @@ class Runtime(ABC):
         if not activate:
             return [interpreter, path]
         venv = str(PurePosixPath(interpreter).parent.parent)
-        command = (
-            'export VIRTUAL_ENV="$1" PATH="${1}/bin:$HOME/.local/bin:$PATH" '
-            'UV_INSTALL_DIR="$HOME/.local/bin" UV_RUN_RECURSION_DEPTH=1; '
-            'shift; exec "$@"'
-        )
-        return [
-            "sh",
-            "-c",
-            command,
-            "uv-script",
-            venv,
-            interpreter,
-            path,
-        ]
+        return [*UV_ACTIVATE_ARGV, venv, interpreter, path]
 
     async def run_uv_script(
         self,
