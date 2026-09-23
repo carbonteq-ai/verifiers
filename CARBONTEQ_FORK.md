@@ -189,5 +189,5 @@ run fork and consumer compatibility suites, then build and clean-install the
 wheel. Publish only immutable CarbonTeq commits and move consumer pins only
 after qualification.
 
-Published implementation commit: `875ac9c6e92c54d195f4cea79101232df1e2b4c5`.
+Published implementation commit: `265fccb9437eac0de212fb44b9bb425b1f9fd050`.
 Consumer revision: pending.
