@@ -233,15 +233,53 @@ async def log_tail(runtime: Runtime, log: str, limit: int = 2000) -> str:
     return ""
 
 
+# The server usually reports its port within a couple of seconds. Poll quickly
+# at first, then back off to the original one-second cadence, keeping the same
+# overall 180 s budget.
+_PORT_POLL_START_S = 0.02
+_PORT_POLL_MAX_S = 1.0
+_PORT_POLL_BUDGET_S = 180.0
+
+
 async def _read_back_port(runtime: Runtime, path: str) -> int:
     """Poll the server's port file until the server writes it."""
-    for _ in range(180):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _PORT_POLL_BUDGET_S
+    delay = _PORT_POLL_START_S
+    while True:
         with contextlib.suppress(Exception):
             data = (await runtime.read(path)).decode().strip()
             if data.isdigit():
                 return int(data)
-        await asyncio.sleep(1)
+        if loop.time() >= deadline:
+            break
+        await asyncio.sleep(delay)
+        delay = min(delay * 1.5, _PORT_POLL_MAX_S)
     raise ToolsetError(f"server did not report its port at {path} in its runtime")
+
+
+async def _probe_from_host(url: str, budget_s: float = 180.0) -> bool:
+    """Probe a server the host can reach directly, without starting a process.
+
+    Mirrors `_PROBE`: any HTTP response (including an error status) means the
+    server is serving; connection failures are retried with a short backoff.
+    Only the response head is awaited, as `urlopen` does, because a streamable
+    HTTP MCP endpoint answers GET with an event stream that never ends.
+    """
+    import httpx
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget_s
+    delay = _PORT_POLL_START_S
+    async with httpx.AsyncClient(timeout=2.0, trust_env=False) as client:
+        while True:
+            with contextlib.suppress(httpx.HTTPError):
+                async with client.stream("GET", url):
+                    return True
+            if loop.time() >= deadline:
+                return False
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.5, _PORT_POLL_MAX_S)
 
 
 async def serve_in_runtime(
@@ -298,10 +336,15 @@ async def serve_in_runtime(
             port = await _read_back_port(runtime, port_file)
         except ToolsetError as e:
             raise ToolsetError(f"{e}: {await log_tail(runtime, log)}") from e
-    probe = await runtime.run(
-        [python, "-c", _PROBE, f"http://127.0.0.1:{port}/mcp"], {}
-    )
-    if probe.exit_code != 0:
+    probe_url = f"http://127.0.0.1:{port}/mcp"
+    if runtime.type == "subprocess":
+        # A subprocess server shares the host's loopback; probing it here saves
+        # starting a Python process per rollout just to make one request.
+        serving = await _probe_from_host(probe_url)
+    else:
+        probe = await runtime.run([python, "-c", _PROBE, probe_url], {})
+        serving = probe.exit_code == 0
+    if not serving:
         raise ToolsetError(
             f"tool server {server.server_name!r} not serving in runtime: {await log_tail(runtime, log)}"
         )

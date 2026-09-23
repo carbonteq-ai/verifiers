@@ -117,6 +117,32 @@ The eval runner stamps the identity before persisting the episode, so concurrent
 completion order does not become an implicit repetition identifier. The field
 is optional for compatibility with historical episode records.
 
+Rollout startup and the local tool path are tuned for agentic RL, where every
+episode starts its own tool server and harness program. `SubprocessConfig`
+gains an opt-in fork server (`fork_server`, `preload`, defaulting to the
+`VF_FORK_SERVER` and comma-separated `VF_FORK_SERVER_PRELOAD` environment
+variables so one setting also reaches tool servers' own runtimes). One warm
+interpreter per Python executable imports the listed modules once and forks
+each `python script|-m module|-c code` program the runtime starts on that
+interpreter, with the caller's session, working directory, environment and
+stdio; anything else, or any fork-server failure, falls back to exec. The pid
+is reported only after the child's `setsid()` and the child is reaped only
+after the caller has read its exit status, so process-group signals never reach
+the zygote or a reused pid. Separately, a local server's port file is polled
+with backoff instead of once a second, a subprocess-runtime server is probed
+from the host instead of by a Python child process, and the MCP tool server
+creates its listener with `IPPROTO_TCP` and `TCP_NODELAY`: asyncio enables
+no-delay per connection only for `IPPROTO_TCP` sockets, and without it every
+tool call waited about 40 ms on a delayed ACK. The same listener fix applies to
+the Docker runtime's passed listener and NeMo Gym servers. For AutomationBench
+at concurrency 16 these cut host time per episode from 6.6 s to 0.65 s.
+
+Changed files: `verifiers/v1/runtimes/subprocess.py`, new
+`verifiers/v1/runtimes/zygote.py` and `_zygote_server.py`,
+`verifiers/v1/mcp/launch.py`, `verifiers/v1/mcp/server.py`,
+`verifiers/v1/runtimes/docker/__init__.py`, and
+`verifiers/v1/tasksets/nemo_gym/server.py`.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
@@ -136,6 +162,11 @@ acknowledged cancellation contract passes in `tests/v1/test_e2e.py`.
 Exact evaluation task selection passes `tests/v1/test_taskset.py` and
 `tests/v1/test_eval_task_selection.py`; the complete v1 suite remains the
 publication gate.
+The fork server's exec parity (argv, `sys.path[0]`, cwd, environment,
+`TMPDIR`, exit codes, pipes, merged background logs, signals, fallbacks and
+64 concurrent programs) passes in `tests/v1/test_subprocess_fork_server.py`;
+`tests/v1/test_mcp_server_latency.py` fails at about 42 ms per call without
+the listener fix and passes (about 3 ms) with it.
 Twenty-seven AutomationBench environment tests pass after removing its optional
 OpenAI Agents schema dependency, which conflicts with Verifiers' MCP 2 runtime.
 Consumer ownership and evidence are documented in Posttrain's

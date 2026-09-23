@@ -278,7 +278,11 @@ class ServerBase(Generic[ConfigT, StateT]):
         host = os.environ.get("MCP_HOST", "127.0.0.1")
         # Remote runtimes require their forwarded port; local servers let the OS choose. Report it
         # before setup so an expensive setup does not block port discovery.
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # asyncio enables TCP_NODELAY per connection only for sockets whose proto
+        # is IPPROTO_TCP; a proto-0 listener leaves Nagle on, and each response
+        # (headers, then body) then waits ~40 ms for the client's delayed ACK.
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.bind((host, int(os.environ.get("MCP_PORT", "0"))))
         port_file = os.environ.get("MCP_PORT_FILE")
