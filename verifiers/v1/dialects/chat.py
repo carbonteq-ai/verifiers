@@ -374,6 +374,7 @@ class ChatDialect(Dialect[ChatCompletion]):
             "extra_body",
         }
     )
+    max_tokens_fields = ("max_tokens", "max_completion_tokens")
     routes = ("/v1/chat/completions",)
     upstream_path = "/chat/completions"
     response_type = ModdedChatCompletion

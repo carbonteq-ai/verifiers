@@ -149,6 +149,24 @@ Changed files: `verifiers/v1/runtimes/subprocess.py`, new
 `verifiers/v1/runtimes/docker/__init__.py`, and
 `verifiers/v1/tasksets/nemo_gym/server.py`.
 
+A request no longer overflows the model's context mid-episode. The
+between-turn `max_total_tokens` check reads the previous call's usage, so a
+turn that starts below the cap could still request `prompt + max_tokens` past
+it and fail with a provider 400 (observed: 57,345 + 8,192 > 65,536). Before each
+model call the interception server now bounds the prompt from the latest
+sampled turn's reported `prompt + completion` tokens plus the UTF-8 bytes of
+the messages appended since (one byte per non-special token is a hard bound
+for byte-level tokenizers) and 16 tokens of scaffolding per message. It lowers
+the request's own output cap to `max_total_tokens - bound - 64`, or, below 256
+tokens of room, refuses the turn with stop condition `max_total_tokens`, which
+`Trace.is_truncated` already counts. A first turn, a prompt that no longer
+matches the recorded history, an image, or a request without an output cap
+is left unchanged.
+
+Changed files: `verifiers/v1/session.py`, `verifiers/v1/interception/server.py`,
+and `verifiers/v1/dialects/{base,chat,responses}.py`; regression tests in
+`tests/v1/test_context_budget.py`.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null

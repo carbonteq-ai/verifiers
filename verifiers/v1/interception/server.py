@@ -62,7 +62,12 @@ from verifiers.v1.interception.tunnel import (
     make_tunnel,
 )
 from verifiers.v1.semantic import ACPInfo, extract_acp_info
-from verifiers.v1.session import IdempotentRequest, ReplayResponse, RolloutSession
+from verifiers.v1.session import (
+    MIN_CONTEXT_OUTPUT_TOKENS,
+    IdempotentRequest,
+    ReplayResponse,
+    RolloutSession,
+)
 from verifiers.v1.trace import Error, ModelCall, PolicyEvent, TimeSpan
 from verifiers.v1.types import FinishReason, Request, Response, Usage
 
@@ -649,6 +654,22 @@ class InterceptionServer(Interception):
             return web.json_response(dialect.error_body(str(error)), status=400)
         except RolloutError as error:
             return self._fail(session, dialect, error)
+
+        # Keep `prompt + max_tokens` inside `max_total_tokens` for this very request: the
+        # between-turn limit check only sees the previous call's usage, so without this a
+        # long episode sends a request the provider rejects as a context overflow.
+        room = session.limits.output_room(turn)
+        if room is not None:
+            if room < MIN_CONTEXT_OUTPUT_TOKENS:
+                turn.commit_prompt(model_request.tools)
+                session.trace.stop("max_total_tokens")
+                logger.debug("context exhausted: id=%s room=%d", session.trace.id, room)
+                return web.json_response(
+                    dialect.error_body("rollout stopped: max_total_tokens"),
+                    status=400,
+                )
+            if (capped := dialect.cap_max_tokens(body, room)) is not None:
+                body = capped
 
         inspect_response = bool(session.response_interceptors or session.response_stops)
         if streaming:

@@ -25,6 +25,8 @@ from verifiers.v1.errors import RolloutError, TaskError
 from verifiers.v1.trace import InterceptRecord, Trace
 from verifiers.v1.types import (
     AssistantMessage,
+    ImageUrlContentPart,
+    Message,
     Messages,
     Request,
     Response,
@@ -56,6 +58,73 @@ def hook_boundary(handler: Callable, *, allow_trace: bool) -> type:
 async def call_hook(handler: Callable, available: dict[type, object]) -> object:
     result = invoke(handler, available)
     return await result if inspect.isawaitable(result) else result
+
+
+CONTEXT_MESSAGE_OVERHEAD_TOKENS = 16
+"""Upper bound on chat-template scaffolding per prompt message (role headers, turn
+delimiters, tool-response wrappers), plus the generation prompt of the next turn."""
+CONTEXT_SAFETY_MARGIN_TOKENS = 64
+"""Headroom kept below `max_total_tokens` on every clamped request."""
+MIN_CONTEXT_OUTPUT_TOKENS = 256
+"""Below this many tokens of room the next turn is not sent: the rollout stops with
+`max_total_tokens` (a truncation) instead of a request the provider would reject."""
+
+
+def message_token_upper_bound(message: Message) -> int | None:
+    """An upper bound on the tokens `message` adds to a rendered prompt, or None when
+    it carries content that cannot be bounded from text (images).
+
+    Byte-level BPE and byte-fallback SentencePiece tokenizers emit at least one UTF-8
+    byte per non-special token, so text bytes bound text tokens; template scaffolding
+    (the only special tokens) is covered by `CONTEXT_MESSAGE_OVERHEAD_TOKENS`."""
+    texts: list[str] = []
+    content = message.content
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, ImageUrlContentPart):
+                return None
+            texts.append(part.text)
+    elif content:
+        texts.append(content)
+    if isinstance(message, AssistantMessage):
+        texts.append(message.reasoning_content or "")
+        for call in message.tool_calls or []:
+            texts.extend((call.id, call.name, call.arguments))
+    elif isinstance(message, ToolMessage):
+        texts.extend((message.tool_call_id, message.name or ""))
+    return CONTEXT_MESSAGE_OVERHEAD_TOKENS + sum(
+        len(text.encode("utf-8")) for text in texts
+    )
+
+
+def prompt_token_upper_bound(turn: graph.PendingTurn) -> int | None:
+    """An upper bound on `turn.prompt`'s rendered length, anchored on provider usage.
+
+    The anchor is the latest sampled assistant node on the prompt's matched graph
+    prefix: the call that produced it reported `prompt + completion` tokens, which is
+    exactly that prefix's length (an overestimate when the template later drops the
+    assistant's reasoning). Messages after the anchor are bounded by
+    `message_token_upper_bound`. None when no anchored call reported usage (e.g. the
+    first turn) or a message cannot be bounded — callers then leave the request as is."""
+    trace = turn.trace
+    usage_by_node = {
+        call.node: call.usage
+        for call in trace.calls
+        if call.node is not None and call.usage is not None
+    }
+    for position in range(len(turn.prefix_node_ids) - 1, -1, -1):
+        node_id = turn.prefix_node_ids[position]
+        usage = usage_by_node.get(node_id)
+        if not trace.nodes[node_id].sampled or usage is None:
+            continue
+        total = usage.total_tokens
+        for message in turn.prompt[position + 1 :]:
+            bound = message_token_upper_bound(message)
+            if bound is None:
+                return None
+            total += bound
+        return total + CONTEXT_MESSAGE_OVERHEAD_TOKENS
+    return None
 
 
 @dataclass(frozen=True)
@@ -92,6 +161,21 @@ class RolloutLimits:
         ):
             return "max_total_tokens"
         return None
+
+    def output_room(self, turn: graph.PendingTurn) -> int | None:
+        """Tokens the next request may generate without its sequence exceeding
+        `max_total_tokens`, or None when uncapped or the prompt cannot be bounded.
+
+        This is the per-request hard edge of the between-turn `max_total_tokens` check:
+        that check reads the previous call's usage, so a turn that starts below the cap
+        can still request `prompt + max_tokens` past it. Bounds each request's own
+        sequence (one branch); the between-turn check keeps its summed semantics."""
+        if self.max_total_tokens is None:
+            return None
+        prompt = prompt_token_upper_bound(turn)
+        if prompt is None:
+            return None
+        return self.max_total_tokens - prompt - CONTEXT_SAFETY_MARGIN_TOKENS
 
 
 @dataclass

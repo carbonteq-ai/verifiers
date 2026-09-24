@@ -409,6 +409,7 @@ class ResponsesDialect(Dialect[OpenAIResponse]):
             "truncation",
         }
     )
+    max_tokens_fields = ("max_output_tokens",)
     routes = ("/v1/responses",)
     upstream_path = "/responses"
     response_type = OpenAIResponse

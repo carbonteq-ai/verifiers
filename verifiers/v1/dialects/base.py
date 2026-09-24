@@ -196,6 +196,10 @@ class Dialect(ABC, Generic[RespT]):
     A whitelist, so payload, conversation state, and tracking fields can never leak
     into the per-call record by omission; an unlisted knob is simply not recorded."""
 
+    max_tokens_fields: ClassVar[tuple[str, ...]] = ("max_tokens",)
+    """Request keys that cap one response's output tokens; the first is this format's
+    canonical spelling. `cap_max_tokens` rewrites whichever are present."""
+
     routes: ClassVar[tuple[str, ...]]
     """The endpoint path(s) a program's SDK posts model turns to. The interception server serves
     one handler per route, so the wire format is resolved from the route the SDK chose (it
@@ -249,6 +253,18 @@ class Dialect(ABC, Generic[RespT]):
     @abstractmethod
     def parse_request(self, body: RawRequest) -> Request:
         """The native request -> the typed model request."""
+
+    def cap_max_tokens(self, body: RawRequest, cap: int) -> RawRequest | None:
+        """`body` with its output-token cap lowered to `cap`, or None when it already
+        asks for at most `cap` or sets no cap (the provider's default then applies)."""
+        present = [
+            key
+            for key in self.max_tokens_fields
+            if isinstance(body.get(key), int) and not isinstance(body[key], bool)
+        ]
+        if all(body[key] <= cap for key in present):
+            return None
+        return {**body, **{key: min(body[key], cap) for key in present}}
 
     def parse_sampling(self, body: RawRequest) -> Sampling:
         """The native request's call settings -> the canonical `Sampling` (for the
