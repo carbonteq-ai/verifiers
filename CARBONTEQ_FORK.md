@@ -70,7 +70,7 @@ format Posttrain trains, including LFM2.5's pythonic tool calls and tool-cycle
 bridge and K2-Horizon's IFM formats, so Verifiers carries no model-specific
 parsers. Each parse reports `reasoning_tokens`, the completion tokens that were
 reasoning, and `response_from_generate` copies it into `Usage.reasoning_tokens`.
-`/inference/v1/generate` returns no usage details, so before this change the
+`pyproject.toml` resolves `carbonteq-renderers` from the explicit `carbonteq-dev` index (`https://pypi.lan/carbonteq/dev/+simple/`). uv honors a Git dependency's sources in its consumers, so this matches how Posttrain pins it; a Git-tag source here would override the consumer's index. `/inference/v1/generate` returns no usage details, so before this change the
 reasoning share of a train-path reply was always unknown. The wire usage block
 carries it as `completion_tokens_details.reasoning_tokens`. Regression:
 `tests/v1/test_train_client.py::test_train_response_reports_the_renderer_reasoning_token_count`.

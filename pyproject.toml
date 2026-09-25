@@ -116,10 +116,15 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
+[[tool.uv.index]]
+name = "carbonteq-dev"
+url = "https://pypi.lan/carbonteq/dev/+simple/"
+explicit = true
+
 [tool.uv.sources]
-# CarbonTeq fork of renderers for this checkout's own lock. Consumers resolve
-# carbonteq-renderers from their internal index instead.
-carbonteq-renderers = { git = "https://github.com/carbonteq-ai/renderers", tag = "carbonteq-v0.1.12.post1.dev1" }
+# CarbonTeq's renderers fork is published to the internal development index.
+# Sources are visible to Git consumers, so this must match how they resolve it.
+carbonteq-renderers = { index = "carbonteq-dev" }
 compact = { path = "environments/compact", editable = true }
 glossary = { path = "environments/glossary", editable = true }
 deepwiki = { path = "environments/deepwiki", editable = true }
