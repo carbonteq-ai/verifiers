@@ -48,7 +48,7 @@ dependencies = [
     "prime-pydantic-config[toml]>=0.4.3",
     "loguru>=0.7.0",
     "tomli-w>=1.0.0",
-    "renderers[multimodal]>=0.1.12.dev2",
+    "carbonteq-renderers[multimodal]>=0.1.12.post1.dev1",
     "typing_extensions>=4.12.2",
     "mcp==2.0.0",
 ]
@@ -147,7 +147,7 @@ ty = "2026-07-28T00:00:00Z"
 prime-tunnel = false
 prime-sandboxes = false
 prime-pydantic-config = false
-renderers = false
+carbonteq-renderers = false
 
 [project.scripts]
 eval = "verifiers.v1.cli.eval.main:main"

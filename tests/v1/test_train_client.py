@@ -3,25 +3,8 @@ from types import SimpleNamespace
 import pytest
 from renderers import DefaultRendererConfig
 
-from verifiers.v1.clients.renderer_extensions import (
-    LFM2ToolParser,
-    bridge_lfm2_tool_cycle,
-)
-from verifiers.v1.clients.train import ElasticRendererPool
+from verifiers.v1.clients.train import ElasticRendererPool, response_from_generate
 from verifiers.v1.configs.client import TrainClientConfig
-
-
-class LFMTokenizer:
-    unk_token_id = -1
-
-    def convert_tokens_to_ids(self, token):
-        return {"<|tool_call_start|>": 100, "<|tool_call_end|>": 101}.get(token, -1)
-
-    def decode(self, token_ids, *, skip_special_tokens):
-        assert skip_special_tokens is False
-        if token_ids == [1]:
-            return "[salesforce_note_create(parent_id='001001', title='Q1')]"
-        return "content"
 
 
 def test_train_client_config_serializes_selected_chat_template():
@@ -36,55 +19,25 @@ def test_train_client_config_serializes_selected_chat_template():
     assert restored.chat_template == "selected {{ messages }}"
 
 
-def test_lfm2_parser_recovers_pythonic_tool_call_without_executing_code():
-    content, calls = LFM2ToolParser(LFMTokenizer()).extract([9, 100, 1, 101])
+@pytest.mark.parametrize("reasoning_tokens", [5, 0, None])
+def test_train_response_reports_the_renderer_reasoning_token_count(reasoning_tokens):
+    result = {
+        "request_id": "r1",
+        "prompt_ids": [1, 2, 3],
+        "completion_ids": [10, 11, 12, 13, 14, 15, 16],
+        "completion_logprobs": [-0.1] * 7,
+        "content": "Answer",
+        "reasoning_content": "plan" if reasoning_tokens else None,
+        "reasoning_tokens": reasoning_tokens,
+        "tool_calls": [],
+        "finish_reason": "stop",
+    }
 
-    assert content == [9]
-    assert len(calls) == 1
-    assert calls[0].name == "salesforce_note_create"
-    assert calls[0].arguments == {"parent_id": "001001", "title": "Q1"}
-    assert calls[0].status.value == "ok"
-    assert calls[0].token_span == (1, 4)
+    response = response_from_generate(result, "policy")
 
-
-def test_lfm2_bridge_restores_template_close_after_stripped_stop_token():
-    class Tokenizer:
-        bos_token_id = 5
-        eos_token_id = 7
-
-        @staticmethod
-        def encode(text, *, add_special_tokens):
-            assert text == "\n"
-            assert add_special_tokens is False
-            return [8]
-
-    class Renderer:
-        _tokenizer = Tokenizer()
-
-        @staticmethod
-        def render(messages, *, tools, add_generation_prompt):
-            assert messages == [{"role": "tool", "content": "created"}]
-            assert tools is None
-            assert add_generation_prompt is True
-            from renderers import RenderedTokens
-
-            return RenderedTokens(
-                token_ids=[5, 9, 10],
-                message_indices=[-1, 0, -1],
-                message_roles=["tool"],
-                message_tool_names=[None],
-            )
-
-    bridged = bridge_lfm2_tool_cycle(
-        Renderer(),
-        [1, 2],
-        [3, 4],
-        [{"role": "tool", "content": "created"}],
-    )
-
-    assert bridged is not None
-    assert bridged.token_ids == [1, 2, 3, 4, 7, 8, 9, 10]
-    assert bridged.message_indices == [-1, -1, -1, -1, -1, -1, 0, -1]
+    assert response.usage.prompt_tokens == 3
+    assert response.usage.completion_tokens == 7
+    assert response.usage.reasoning_tokens == reasoning_tokens
 
 
 @pytest.mark.asyncio

@@ -63,16 +63,17 @@ reconstructs the task. Older clients may omit `task_config` and retain the
 static-config behavior. The CLI and CarbonTeq Posttrain caller send the complete
 task. Regression coverage proves both the derived-config and legacy paths.
 
-The training client registers an `lfm2` structured-output parser for the
-default renderer. It recognizes LFM2's special-token-delimited Python call
-list using `ast.literal_eval`; sampled text is never executed. Its incremental
-tool-cycle bridge also preserves the exact sampled token prefix when vLLM has
-stripped the stop token, appending only the protocol close/newline scaffold and
-new tool observations. Posttrain opts into this behavior through its versioned
-LFM conversation contract. This is a generic model-protocol compatibility seam
-and does not introduce task, environment, reward, or trainer-algorithm
-ownership into Verifiers. The parser and bridge should move to the upstream
-`renderers` package when that package accepts LFM2 as a native protocol.
+The training client depends on `carbonteq-renderers`, CarbonTeq's fork of the
+`renderers` package (import name `renderers`; ledger in
+`carbonteq-ai/renderers` `CARBONTEQ_FORK.md`). The fork owns every model output
+format Posttrain trains, including LFM2.5's pythonic tool calls and tool-cycle
+bridge and K2-Horizon's IFM formats, so Verifiers carries no model-specific
+parsers. Each parse reports `reasoning_tokens`, the completion tokens that were
+reasoning, and `response_from_generate` copies it into `Usage.reasoning_tokens`.
+`/inference/v1/generate` returns no usage details, so before this change the
+reasoning share of a train-path reply was always unknown. The wire usage block
+carries it as `completion_tokens_details.reasoning_tokens`. Regression:
+`tests/v1/test_train_client.py::test_train_response_reports_the_renderer_reasoning_token_count`.
 
 `Env.serving(client_factory=...)` accepts an optional host-owned client factory
 and threads it through server, static-pool and elastic-pool interception.
