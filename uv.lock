@@ -21,13 +21,13 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
-prime-tunnel = false
-prime-sandboxes = false
+carbonteq-renderers = false
 harbor = "2026-08-11T00:00:00Z"
-ty = "2026-07-28T00:00:00Z"
 prime-pydantic-config = false
-renderers = false
+prime-sandboxes = false
+prime-tunnel = false
 ruff = "2026-07-28T00:00:00Z"
+ty = "2026-07-28T00:00:00Z"
 
 [[package]]
 name = "aiofile"
@@ -563,6 +563,55 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/43/a4/d53ed7e639b778b6f41a5e7c664b37f75830e38afa62dad62ec913674548/caio-0.12.2-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:e33295963f5a4787355b8bfd754b4f0e7ac5d535138860748c1eb833ca10d620", size = 218220, upload-time = "2026-08-04T14:43:29.656Z" },
     { url = "https://files.pythonhosted.org/packages/f8/d6/c353fd1dda371262995bba1b2f9aa42cc6cf7fc82c0853238510aa655bb9/caio-0.12.2-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:15af6eb10d7705a92ee8143d8a4d89c2886ecb6b65ce1161d3dad1adb9b3cbec", size = 216106, upload-time = "2026-08-04T14:43:31.011Z" },
     { url = "https://files.pythonhosted.org/packages/61/8a/71b0144f783468ba9f1bbf8a2f8e45c7d85ae31ec192f10650aa46f31702/caio-0.12.2-py3-none-any.whl", hash = "sha256:5233e797c9fe2b541914b1bc2e2df82677e2206b537e44e252188f3c2cbb0ea9", size = 62548, upload-time = "2026-08-04T14:43:32.394Z" },
+]
+
+[[package]]
+name = "carbonteq-renderers"
+version = "0.1.12.post1.dev1"
+source = { git = "https://github.com/carbonteq-ai/renderers?tag=carbonteq-v0.1.12.post1.dev1#6aba28a8c9a597475addc2c123dd18b28a462766" }
+dependencies = [
+    { name = "httpx" },
+    { name = "jinja2" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "openai" },
+    { name = "openai-harmony" },
+    { name = "prime-pydantic-config" },
+    { name = "tiktoken" },
+]
+
+[package.optional-dependencies]
+multimodal = [
+    { name = "pillow" },
+    { name = "transformers" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "jinja2" },
+    { name = "numpy" },
+    { name = "openai", specifier = ">=1.108.1" },
+    { name = "openai-harmony", specifier = ">=0.0.4" },
+    { name = "pillow", marker = "extra == 'multimodal'", specifier = ">=12.2.0" },
+    { name = "prime-pydantic-config", specifier = ">=0.3.0.dev83" },
+    { name = "tiktoken" },
+    { name = "transformers", marker = "extra == 'multimodal'", specifier = ">=4.50.0" },
+    { name = "transformers", marker = "extra == 'transformers'", specifier = ">=4.50.0" },
+]
+provides-extras = ["multimodal", "transformers"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pillow", specifier = ">=12.2.0" },
+    { name = "pre-commit" },
+    { name = "pytest", specifier = ">=7.0.0" },
+    { name = "pytest-asyncio", specifier = ">=0.21.0" },
+    { name = "ruff" },
+    { name = "torch", specifier = ">=2.11.0" },
+    { name = "torchvision", specifier = ">=0.26.0" },
+    { name = "transformers", specifier = ">=4.50.0" },
+    { name = "ty", specifier = ">=0.0.1a29,<0.0.22" },
 ]
 
 [[package]]
@@ -4509,30 +4558,6 @@ wheels = [
 ]
 
 [[package]]
-name = "renderers"
-version = "0.1.12.dev2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jinja2" },
-    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
-    { name = "numpy", version = "2.5.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
-    { name = "openai" },
-    { name = "openai-harmony" },
-    { name = "prime-pydantic-config" },
-    { name = "tiktoken" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/09/86/4016c7ea6cbc2c3258265b11766d3018b805563f3b7fbcf7edd6df38690d/renderers-0.1.12.dev2.tar.gz", hash = "sha256:7cc764dec4d0c5c48a20a610df52ec3be2de3d4f0c65cb5d709487e0bad761a8", size = 394034, upload-time = "2026-09-01T21:31:06.753Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/89/4be1a4ce35e85ecbcccfd8bc7e869fb23424c7b93696e29149e555bddae1/renderers-0.1.12.dev2-py3-none-any.whl", hash = "sha256:9e4043d87982a9f51ca151071baac7f30053e9c896356957e228fa4791cfd793", size = 231100, upload-time = "2026-09-01T21:31:04.936Z" },
-]
-
-[package.optional-dependencies]
-multimodal = [
-    { name = "pillow" },
-    { name = "transformers" },
-]
-
-[[package]]
 name = "requests"
 version = "2.34.2"
 source = { registry = "https://pypi.org/simple" }
@@ -5356,6 +5381,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
     { name = "anthropic" },
+    { name = "carbonteq-renderers", extra = ["multimodal"] },
     { name = "gepa" },
     { name = "h11" },
     { name = "httpx" },
@@ -5372,7 +5398,6 @@ dependencies = [
     { name = "prime-tunnel" },
     { name = "pydantic" },
     { name = "pyzmq" },
-    { name = "renderers", extra = ["multimodal"] },
     { name = "rich" },
     { name = "tenacity" },
     { name = "tomli-w" },

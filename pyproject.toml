@@ -117,6 +117,9 @@ url = "https://pypi.org/simple"
 default = true
 
 [tool.uv.sources]
+# CarbonTeq fork of renderers for this checkout's own lock. Consumers resolve
+# carbonteq-renderers from their internal index instead.
+carbonteq-renderers = { git = "https://github.com/carbonteq-ai/renderers", tag = "carbonteq-v0.1.12.post1.dev1" }
 compact = { path = "environments/compact", editable = true }
 glossary = { path = "environments/glossary", editable = true }
 deepwiki = { path = "environments/deepwiki", editable = true }
