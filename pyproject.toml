@@ -111,20 +111,22 @@ required-version = ">=0.11.1"
 exclude-newer = "7 days"
 default-groups = ["dev", "examples"]
 
+# PyPI is listed first so every package it carries resolves there; the
+# internal index below only supplies what PyPI lacks (carbonteq-renderers).
 [[tool.uv.index]]
 name = "pypi"
 url = "https://pypi.org/simple"
-default = true
 
+# CarbonTeq's renderers fork is published to the internal development index.
+# It is a plain (non-explicit) index for this repository's own lock. There is
+# deliberately no `carbonteq-renderers` source: uv applies a Git dependency's
+# sources in every consumer, and an index pin would stop consumers outside the
+# LAN from supplying the published wheel from their own index or wheelhouse.
 [[tool.uv.index]]
 name = "carbonteq-dev"
 url = "https://pypi.lan/carbonteq/dev/+simple/"
-explicit = true
 
 [tool.uv.sources]
-# CarbonTeq's renderers fork is published to the internal development index.
-# Sources are visible to Git consumers, so this must match how they resolve it.
-carbonteq-renderers = { index = "carbonteq-dev" }
 compact = { path = "environments/compact", editable = true }
 glossary = { path = "environments/glossary", editable = true }
 deepwiki = { path = "environments/deepwiki", editable = true }
