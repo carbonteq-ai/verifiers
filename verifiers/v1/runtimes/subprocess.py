@@ -20,6 +20,7 @@ from verifiers.v1.runtimes import zygote
 from verifiers.v1.runtimes.base import (
     UV_ACTIVATE_ARGV,
     BaseRuntimeInfo,
+    LoopLocks,
     ProgramResult,
     Runtime,
     RuntimeProcess,
@@ -122,7 +123,7 @@ class SubprocessRuntime(Runtime):
     # Share prepared script environments across the worker's per-rollout runtimes.
     scripts_dir: ClassVar[str] = str(CACHE_DIR / "runtimes" / "scripts")
     _interpreters: ClassVar[dict[str, str]] = {}
-    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _locks: ClassVar[LoopLocks] = LoopLocks()
 
     def __init__(self, config: SubprocessConfig, name: str | None = None) -> None:
         super().__init__(name)

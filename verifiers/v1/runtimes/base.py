@@ -138,6 +138,27 @@ class BaseRuntimeInfo(BaseConfig):
     (`Agent.run(runtime=...)`) rather than provisioning its own."""
 
 
+class LoopLocks:
+    """Named ``asyncio.Lock`` objects, one set per running event loop.
+
+    An asyncio lock belongs to the loop that first awaits it. Runtimes are shared
+    across the event loops a trainer opens for successive collections, and a
+    scoring call that times out is abandoned while holding its lock, so a single
+    process-wide lock left later loops failing with "bound to a different event
+    loop". Keying by the running loop gives every loop fresh locks and drops a
+    dead loop's locks with it.
+    """
+
+    def __init__(self) -> None:
+        self._by_loop: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, dict[str, asyncio.Lock]
+        ] = weakref.WeakKeyDictionary()
+
+    def get(self, name: str = "") -> asyncio.Lock:
+        locks = self._by_loop.setdefault(asyncio.get_running_loop(), {})
+        return locks.setdefault(name, asyncio.Lock())
+
+
 class Runtime(ABC):
     __slots__ = ("env",)
 
@@ -163,9 +184,9 @@ class Runtime(ABC):
         # Explicit process values (model credentials, proxy settings, etc.) override these.
         self.env: dict[str, str] = {}
         self._uv_interpreters: dict[str, str] = {}
-        self._uv_script_locks: dict[str, asyncio.Lock] = {}
+        self._uv_script_locks: LoopLocks = LoopLocks()
         self._mcp_sources: set[str] = set()
-        self._mcp_install_lock = asyncio.Lock()
+        self._mcp_install_locks: LoopLocks = LoopLocks()
         self._setup_claimed = False
         self.stopped = False
         """Whether teardown has begun (set by `stop`). A stopped runtime is dead: a rollout
@@ -270,7 +291,7 @@ class Runtime(ABC):
         digest = hashlib.sha256(data).hexdigest()
         path = f"{self.scripts_dir}/{digest}.py"
         if digest not in self._uv_interpreters:
-            async with self._uv_script_locks.setdefault(digest, asyncio.Lock()):
+            async with self._uv_script_locks.get(digest):
                 if digest not in self._uv_interpreters:
                     tmp = f"{path}.{uuid.uuid4().hex}.tmp"
                     await self.write(tmp, data)

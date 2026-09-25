@@ -193,7 +193,7 @@ async def _install_in_sandbox(server: ServerBase, runtime: Runtime) -> str:
     root_q, temp_q, cache_q, venv_q = map(shlex.quote, (root, temp, cache, venv))
     # Colocated servers and borrowed views install into one physical environment.
     # Serialize its mutations and only remember sources after a successful install.
-    async with runtime._mcp_install_lock:
+    async with runtime._mcp_install_locks.get():
         sources = dict.fromkeys((str(_verifiers_root()), source_dir))
         pending = [source for source in sources if source not in runtime._mcp_sources]
         if not pending:
