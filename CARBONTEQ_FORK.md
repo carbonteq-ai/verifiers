@@ -150,6 +150,22 @@ Changed files: `verifiers/v1/runtimes/subprocess.py`, new
 `verifiers/v1/runtimes/docker/__init__.py`, and
 `verifiers/v1/tasksets/nemo_gym/server.py`.
 
+### Boxed-math scoring off the main thread
+
+`verify_boxed_math_answer` bounds math-verify's `parse` and `verify` with
+`parsing_timeout`/`timeout_seconds`, which math-verify enforces with
+`signal.alarm`. Python allows that only on the main thread; off it, math-verify
+raised and the broad `except` scored every answer 0.0, however correct.
+Trainers that run episodes off the main thread (veRL scores inside Ray async
+actors) therefore trained on zero rewards for every math-verify environment
+(found by Posttrain qualification `q0412j-ws-verl-bf16-r1`, GSM8K: every trace
+scored 0, including replies ending in the gold answer). Off the main thread the
+pair is now scored in a one-process `spawn` worker pool, whose main thread
+keeps the same timeouts; a worker that outlives its own alarm is killed and
+replaced and the answer scores 0.0. Main-thread scoring is unchanged.
+Regression: `test_boxed_math_answer_scores_off_the_main_thread` in
+`tests/v1/test_scoring.py` fails before the change.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
