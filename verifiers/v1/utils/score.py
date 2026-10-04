@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import multiprocessing
 import re
+import threading
 from collections.abc import Sequence
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING
 
@@ -98,6 +102,17 @@ def verify_boxed_math_answer(
     if not prediction or not gold:
         return 0.0
 
+    if threading.current_thread() is threading.main_thread():
+        return _verify_boxed_pair(gold, prediction, timeout_seconds)
+    # math-verify bounds parse and verify with signal.alarm, which Python allows
+    # only on the main thread; elsewhere it raises and the answer used to score
+    # zero whatever it said. Trainers that run episodes off the main thread
+    # (e.g. inside Ray async actors) score in a worker process, whose main thread
+    # keeps the same timeout.
+    return _verify_boxed_pair_in_process(gold, prediction, timeout_seconds)
+
+
+def _verify_boxed_pair(gold: str, prediction: str, timeout_seconds: int) -> float:
     # math-verify expects both sides as boxed math expressions.
     try:
         parsed_gold = parse(f"\\boxed{{{gold}}}", parsing_timeout=timeout_seconds)
@@ -113,6 +128,46 @@ def verify_boxed_math_answer(
             )
         )
     except (Exception, MathVerifyTimeout):  # noqa: BLE001 - malformed answers score zero
+        return 0.0
+
+
+_MATH_POOL: ProcessPoolExecutor | None = None
+_MATH_POOL_LOCK = threading.Lock()
+# Worker start-up (importing math-verify and sympy) on top of the in-process
+# parse and verify timeouts.
+_MATH_POOL_STARTUP_SECONDS = 60
+
+
+def _math_pool() -> ProcessPoolExecutor:
+    global _MATH_POOL
+    with _MATH_POOL_LOCK:
+        if _MATH_POOL is None:
+            _MATH_POOL = ProcessPoolExecutor(
+                max_workers=1, mp_context=multiprocessing.get_context("spawn")
+            )
+        return _MATH_POOL
+
+
+def _discard_math_pool(pool: ProcessPoolExecutor) -> None:
+    global _MATH_POOL
+    with _MATH_POOL_LOCK:
+        if _MATH_POOL is pool:
+            _MATH_POOL = None
+    pool.shutdown(wait=False, cancel_futures=True)
+    for process in list(getattr(pool, "_processes", {}).values()):
+        process.kill()
+
+
+def _verify_boxed_pair_in_process(
+    gold: str, prediction: str, timeout_seconds: int
+) -> float:
+    pool = _math_pool()
+    future = pool.submit(_verify_boxed_pair, gold, prediction, timeout_seconds)
+    try:
+        return future.result(timeout=3 * timeout_seconds + _MATH_POOL_STARTUP_SECONDS)
+    except FutureTimeout:
+        # The worker ignored its own alarm; replace it so later answers score.
+        _discard_math_pool(pool)
         return 0.0
 
 

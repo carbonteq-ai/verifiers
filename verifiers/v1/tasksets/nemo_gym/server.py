@@ -45,7 +45,10 @@ HOST = "127.0.0.1"
 
 
 def main() -> None:
-    sock = socket.socket()
+    # A proto-0 listener leaves Nagle on for accepted connections (see
+    # verifiers.v1.mcp.server), adding ~40 ms to each response.
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     sock.bind((HOST, 0))
     port = sock.getsockname()[1]

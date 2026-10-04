@@ -2,19 +2,25 @@
 
 import asyncio
 import contextlib
+import logging
 import os
 import shutil
 import signal
 import stat
+import sys
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import ClassVar, Literal
+from typing import IO, ClassVar, Literal
 
+from pydantic import Field
 from pydantic_config import BaseConfig
 
 from verifiers.v1.errors import SandboxError
+from verifiers.v1.runtimes import zygote
 from verifiers.v1.runtimes.base import (
+    UV_ACTIVATE_ARGV,
     BaseRuntimeInfo,
+    LoopLocks,
     ProgramResult,
     Runtime,
     RuntimeProcess,
@@ -23,14 +29,35 @@ from verifiers.v1.utils.paths import CACHE_DIR
 
 _BACKGROUND_STOP_TIMEOUT = 5
 
+logger = logging.getLogger(__name__)
+
 # Implicit host inheritance removes every name containing "API_KEY" while keeping
 # harmless settings such as PATH, HOME, and cache locations. The explicit `env`
 # argument is merged afterward, so callers can deliberately pass credentials and
 # child processes inherit them. Containers and sandboxes inherit no host environment.
 
 
+def _fork_server_default() -> bool:
+    return os.environ.get("VF_FORK_SERVER", "").lower() in ("1", "true", "yes")
+
+
+def _preload_default() -> list[str]:
+    return [m for m in os.environ.get("VF_FORK_SERVER_PRELOAD", "").split(",") if m]
+
+
 class SubprocessConfig(BaseConfig):
     type: Literal["subprocess"] = "subprocess"
+    fork_server: bool = Field(default_factory=_fork_server_default)
+    """Start Python programs that run on this worker's interpreter (tool servers,
+    and harness scripts on a preinstalled interpreter) by forking a warm server
+    that has already imported `preload`, instead of starting a new interpreter.
+    See `verifiers.v1.runtimes.zygote` for what a forked program shares.
+    Defaults to `VF_FORK_SERVER`, so one setting covers every subprocess runtime
+    a worker creates, including tool servers' own runtimes."""
+    preload: list[str] = Field(default_factory=_preload_default)
+    """Modules the fork server imports once, e.g. a tool server's module and the
+    harness program's client libraries. Defaults to the comma-separated
+    `VF_FORK_SERVER_PRELOAD`."""
 
 
 class SubprocessRuntimeInfo(SubprocessConfig, BaseRuntimeInfo):
@@ -43,7 +70,8 @@ async def read_stream(reader: asyncio.StreamReader) -> AsyncIterator[bytes]:
 
 
 def signal_process(
-    process: asyncio.subprocess.Process, signal_: signal.Signals
+    process: "asyncio.subprocess.Process | zygote.ZygoteProcess",
+    signal_: signal.Signals,
 ) -> None:
     if process.returncode is not None:
         return
@@ -53,8 +81,22 @@ def signal_process(
         os.killpg(os.getpgid(process.pid), signal_)
 
 
+def _child_fd(stream: int | IO[bytes] | None, inherited: int) -> int | None:
+    """The descriptor a forked child gets for an `asyncio` stdio argument;
+    None means a new pipe."""
+    if stream == asyncio.subprocess.PIPE:
+        return None
+    if stream is None:
+        return inherited
+    if isinstance(stream, int):
+        return stream
+    return stream.fileno()
+
+
 class SubprocessProcess(RuntimeProcess):
-    def __init__(self, process: asyncio.subprocess.Process) -> None:
+    def __init__(
+        self, process: "asyncio.subprocess.Process | zygote.ZygoteProcess"
+    ) -> None:
         self._process = process
         assert process.stdin is not None
         assert process.stdout is not None
@@ -81,7 +123,7 @@ class SubprocessRuntime(Runtime):
     # Share prepared script environments across the worker's per-rollout runtimes.
     scripts_dir: ClassVar[str] = str(CACHE_DIR / "runtimes" / "scripts")
     _interpreters: ClassVar[dict[str, str]] = {}
-    _locks: ClassVar[dict[str, asyncio.Lock]] = {}
+    _locks: ClassVar[LoopLocks] = LoopLocks()
 
     def __init__(self, config: SubprocessConfig, name: str | None = None) -> None:
         super().__init__(name)
@@ -90,23 +132,121 @@ class SubprocessRuntime(Runtime):
         self.config = config
         self.info = SubprocessRuntimeInfo(**config.model_dump())
         self.workdir: Path | None = None
-        self._background: list[asyncio.subprocess.Process] = []
+        self._background: list[asyncio.subprocess.Process | zygote.ZygoteProcess] = []
 
     async def start(self) -> None:
         self.workdir = CACHE_DIR / "runtimes" / "subprocess" / self.name
         self.workdir.mkdir(parents=True)
         self.info.id = str(self.workdir)
 
-    async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
-        full_env = {k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()}
+    def _host_env(self) -> dict[str, str]:
+        return {k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()}
+
+    def _fork_candidate(
+        self, argv: list[str], env: dict[str, str]
+    ) -> tuple[str, list[str], dict[str, str]] | None:
+        """The interpreter, argv and env a fork would run, or None to exec.
+
+        Programs on this worker's interpreter qualify, as do prepared uv script
+        environments started through `UV_ACTIVATE_ARGV`, whose environment
+        changes are applied here exactly as the wrapper's shell would."""
+        if tuple(argv[:4]) == UV_ACTIVATE_ARGV and len(argv) >= 7:
+            venv, argv = argv[4], argv[5:]
+            if argv[0] not in self._uv_interpreters.values():
+                return None
+            home = env.get("HOME", "")
+            env = {
+                **env,
+                "VIRTUAL_ENV": venv,
+                "PATH": f"{venv}/bin:{home}/.local/bin:{env.get('PATH', '')}",
+                "UV_INSTALL_DIR": f"{home}/.local/bin",
+                "UV_RUN_RECURSION_DEPTH": "1",
+            }
+            python = argv[0]
+        else:
+            python = sys.executable
+        return (python, argv, env) if zygote.eligible(argv, python) else None
+
+    async def _zygote_for(
+        self, argv: list[str], env: dict[str, str]
+    ) -> tuple[zygote.Zygote, list[str], dict[str, str]] | None:
+        if not self.config.fork_server:
+            return None
+        candidate = self._fork_candidate(argv, env)
+        if candidate is None:
+            return None
+        python, argv, env = candidate
+        server = await asyncio.to_thread(
+            zygote.get_zygote, python, self.config.preload, self._host_env()
+        )
+        if server is None or not server.accepts(argv, env):
+            return None
+        return server, argv, env
+
+    async def _spawn(
+        self,
+        argv: list[str],
+        env: dict[str, str],
+        *,
+        stdin: int | None,
+        stdout: int | IO[bytes] | None,
+        stderr: int | None,
+    ) -> "asyncio.subprocess.Process | zygote.ZygoteProcess":
+        """Start `argv` in its own session (so the whole tree can be signalled).
+
+        Stdio arguments follow `asyncio.create_subprocess_exec`, restricted to
+        PIPE, STDOUT (stderr only), an open file, or None to inherit."""
+        full_env = self._host_env()
         full_env.update(self.process_env(env))
-        proc = await asyncio.create_subprocess_exec(
+        fork = await self._zygote_for(argv, full_env)
+        # A fork needs a descriptor per stream (None asks it for a new pipe); a
+        # stderr merged into a new stdout pipe is left to exec.
+        merged_into_pipe = (
+            stderr == asyncio.subprocess.STDOUT and stdout == asyncio.subprocess.PIPE
+        )
+        if fork is not None and not merged_into_pipe:
+            server, fork_argv, fork_env = fork
+            in_fd = _child_fd(stdin, 0)
+            out_fd = _child_fd(stdout, 1)
+            err_fd = (
+                out_fd if stderr == asyncio.subprocess.STDOUT else _child_fd(stderr, 2)
+            )
+            try:
+                return await server.spawn(
+                    fork_argv,
+                    fork_env,
+                    str(self.workdir),
+                    stdin=in_fd,
+                    stdout=out_fd,
+                    stderr=err_fd,
+                )
+            except (OSError, RuntimeError) as exc:
+                self._fork_server_failed(exc)
+        return await asyncio.create_subprocess_exec(
             *argv,
             env=full_env,
             cwd=self.workdir,
+            stdin=stdin,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+
+    _fork_warned: ClassVar[bool] = False
+
+    @classmethod
+    def _fork_server_failed(cls, exc: BaseException) -> None:
+        if not cls._fork_warned:
+            cls._fork_warned = True
+            logger.warning("fork server spawn failed, using exec: %s", exc)
+
+    async def run(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
+        proc = await self._spawn(
+            argv,
+            env,
+            stdin=None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,  # own process group, so we can reap the whole tree
         )
         try:
             stdout, stderr = await proc.communicate()
@@ -128,16 +268,12 @@ class SubprocessRuntime(Runtime):
     async def open_process(
         self, argv: list[str], env: dict[str, str]
     ) -> RuntimeProcess:
-        full_env = {k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()}
-        full_env.update(self.process_env(env))
-        proc = await asyncio.create_subprocess_exec(
-            *argv,
-            env=full_env,
-            cwd=self.workdir,
+        proc = await self._spawn(
+            argv,
+            env,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
         )
         self._background.append(proc)
         return SubprocessProcess(proc)
@@ -145,19 +281,12 @@ class SubprocessRuntime(Runtime):
     async def run_background(
         self, argv: list[str], env: dict[str, str], log: str
     ) -> None:
-        full_env = {k: v for k, v in os.environ.items() if "API_KEY" not in k.upper()}
-        full_env.update(self.process_env(env))
         logfile = self.workdir / log
         with logfile.open(
             "wb"
         ) as f:  # child dups the fd; safe to close ours after spawn
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
-                env=full_env,
-                cwd=self.workdir,
-                stdout=f,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,  # own process group, so cleanup() reaps the whole tree
+            proc = await self._spawn(
+                argv, env, stdin=None, stdout=f, stderr=asyncio.subprocess.STDOUT
             )
         self._background.append(
             proc

@@ -102,16 +102,17 @@ reconstructs the task. Older clients may omit `task_config` and retain the
 static-config behavior. The CLI and CarbonTeq Posttrain caller send the complete
 task. Regression coverage proves both the derived-config and legacy paths.
 
-The training client registers an `lfm2` structured-output parser for the
-default renderer. It recognizes LFM2's special-token-delimited Python call
-list using `ast.literal_eval`; sampled text is never executed. Its incremental
-tool-cycle bridge also preserves the exact sampled token prefix when vLLM has
-stripped the stop token, appending only the protocol close/newline scaffold and
-new tool observations. Posttrain opts into this behavior through its versioned
-LFM conversation contract. This is a generic model-protocol compatibility seam
-and does not introduce task, environment, reward, or trainer-algorithm
-ownership into Verifiers. The parser and bridge should move to the upstream
-`renderers` package when that package accepts LFM2 as a native protocol.
+The training client depends on `carbonteq-renderers`, CarbonTeq's fork of the
+`renderers` package (import name `renderers`; ledger in
+`carbonteq-ai/renderers` `CARBONTEQ_FORK.md`). The fork owns every model output
+format Posttrain trains, including LFM2.5's pythonic tool calls and tool-cycle
+bridge and K2-Horizon's IFM formats, so Verifiers carries no model-specific
+parsers. Each parse reports `reasoning_tokens`, the completion tokens that were
+reasoning, and `response_from_generate` copies it into `Usage.reasoning_tokens`.
+`pyproject.toml` lists PyPI and then the internal `carbonteq-dev` index (`https://pypi.lan/carbonteq/dev/+simple/`) for this repository's own lock, with no `carbonteq-renderers` source. uv applies a Git dependency's sources in every consumer, so a source pin here would force consumers outside the LAN to reach `pypi.lan`; instead each consumer supplies the published wheel from its own index or wheelhouse. `/inference/v1/generate` returns no usage details, so before this change the
+reasoning share of a train-path reply was always unknown. The wire usage block
+carries it as `completion_tokens_details.reasoning_tokens`. Regression:
+`tests/v1/test_train_client.py::test_train_response_reports_the_renderer_reasoning_token_count`.
 
 `Env.serving(client_factory=...)` accepts an optional host-owned client factory
 and threads it through server, static-pool and elastic-pool interception.
@@ -156,6 +157,54 @@ The eval runner stamps the identity before persisting the episode, so concurrent
 completion order does not become an implicit repetition identifier. The field
 is optional for compatibility with historical episode records.
 
+Rollout startup and the local tool path are tuned for agentic RL, where every
+episode starts its own tool server and harness program. `SubprocessConfig`
+gains an opt-in fork server (`fork_server`, `preload`, defaulting to the
+`VF_FORK_SERVER` and comma-separated `VF_FORK_SERVER_PRELOAD` environment
+variables so one setting also reaches tool servers' own runtimes). One warm
+interpreter per Python executable imports the listed modules once and forks
+each `python script|-m module|-c code` program the runtime starts on that
+interpreter, with the caller's session, working directory, environment and
+stdio. Prepared uv script environments started through the runtime's own
+activation wrapper (`UV_ACTIVATE_ARGV`) fork from a zygote for that
+environment's interpreter, with the wrapper's variables applied. A `-m`
+program's module is imported into the zygote on first use, so tool servers
+start warm without being named in `preload`; if any import leaves a Python
+thread running, the zygote retires. Anything else, or any fork-server
+failure, falls back to exec. The pid
+is reported only after the child's `setsid()` and the child is reaped only
+after the caller has read its exit status, so process-group signals never reach
+the zygote or a reused pid. Separately, a local server's port file is polled
+with backoff instead of once a second, a subprocess-runtime server is probed
+from the host instead of by a Python child process, and the MCP tool server
+creates its listener with `IPPROTO_TCP` and `TCP_NODELAY`: asyncio enables
+no-delay per connection only for `IPPROTO_TCP` sockets, and without it every
+tool call waited about 40 ms on a delayed ACK. The same listener fix applies to
+the Docker runtime's passed listener and NeMo Gym servers. For AutomationBench
+at concurrency 16 these cut host time per episode from 6.6 s to 0.65 s.
+
+Changed files: `verifiers/v1/runtimes/subprocess.py`, new
+`verifiers/v1/runtimes/zygote.py` and `_zygote_server.py`,
+`verifiers/v1/mcp/launch.py`, `verifiers/v1/mcp/server.py`,
+`verifiers/v1/runtimes/docker/__init__.py`, and
+`verifiers/v1/tasksets/nemo_gym/server.py`.
+
+### Boxed-math scoring off the main thread
+
+`verify_boxed_math_answer` bounds math-verify's `parse` and `verify` with
+`parsing_timeout`/`timeout_seconds`, which math-verify enforces with
+`signal.alarm`. Python allows that only on the main thread; off it, math-verify
+raised and the broad `except` scored every answer 0.0, however correct.
+Trainers that run episodes off the main thread (veRL scores inside Ray async
+actors) therefore trained on zero rewards for every math-verify environment
+(found by Posttrain qualification `q0412j-ws-verl-bf16-r1`, GSM8K: every trace
+scored 0, including replies ending in the gold answer). Off the main thread the
+pair is now scored in a one-process `spawn` worker pool, whose main thread
+keeps the same timeouts; a worker that outlives its own alarm is killed and
+replaced and the answer scores 0.0. Main-thread scoring is unchanged.
+Regression: `test_boxed_math_answer_scores_off_the_main_thread` in
+`tests/v1/test_scoring.py` fails before the change.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
@@ -175,6 +224,11 @@ acknowledged cancellation contract passes in `tests/v1/test_e2e.py`.
 Exact evaluation task selection passes `tests/v1/test_taskset.py` and
 `tests/v1/test_eval_task_selection.py`; the complete v1 suite remains the
 publication gate.
+The fork server's exec parity (argv, `sys.path[0]`, cwd, environment,
+`TMPDIR`, exit codes, pipes, merged background logs, signals, fallbacks and
+64 concurrent programs) passes in `tests/v1/test_subprocess_fork_server.py`;
+`tests/v1/test_mcp_server_latency.py` fails at about 42 ms per call without
+the listener fix and passes (about 3 ms) with it.
 Twenty-seven AutomationBench environment tests pass after removing its optional
 OpenAI Agents schema dependency, which conflicts with Verifiers' MCP 2 runtime.
 Consumer ownership and evidence are documented in Posttrain's
@@ -257,3 +311,8 @@ receipt admission rejects copied boolean coordinates. Real-session coordinate
 fixtures use manufactured exact parser evidence; production renderer and consumer
 qualification remain separate. Consumer evidence:
 `docs/research/verifiers-assessment-qualification/reward-candidate/execution-token-alignment-checkpoint.md`.
+
+Published implementation commit: `265fccb9437eac0de212fb44b9bb425b1f9fd050`.
+Consumer revision: Posttrain 0.4.5 selects `0cee0a075ddf1883498be0fde34155655cb19146`
+(renderer reasoning-token counts through `carbonteq-renderers` 0.1.12.post1.dev1,
+without a consumer-visible index pin).

@@ -1432,3 +1432,24 @@ async def test_intrinsic_task_and_episode_scores_have_fresh_owners(api):
             assert _owner.get() is outer
             assert observed[-1] is not outer and observed[-1].closed and not observed[-1].proofs
         assert observed[0] is not observed[1]
+
+
+def test_boxed_math_answer_scores_off_the_main_thread() -> None:
+    """math-verify's timeout uses signal.alarm, which only the main thread may
+    set; trainers such as veRL score inside Ray actors off the main thread."""
+    import threading
+
+    from verifiers.v1.utils.score import verify_boxed_math_answer
+
+    results: dict[str, float] = {}
+
+    def score() -> None:
+        results["correct"] = verify_boxed_math_answer("so \\boxed{12}", "12")
+        results["wrong"] = verify_boxed_math_answer("so \\boxed{13}", "12")
+
+    worker = threading.Thread(target=score)
+    worker.start()
+    worker.join()
+
+    assert results == {"correct": 1.0, "wrong": 0.0}
+    assert verify_boxed_math_answer("so \\boxed{12}", "12") == 1.0

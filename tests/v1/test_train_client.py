@@ -4,14 +4,9 @@ from types import SimpleNamespace
 import pytest
 from renderers import DefaultRendererConfig
 
-from verifiers.v1.clients.renderer_extensions import (
-    K2IFMReasoningParser,
-    K2IFMToolParser,
-    LFM2ToolParser,
-    bridge_lfm2_tool_cycle,
-)
-from verifiers.v1.clients.train import ElasticRendererPool
+from verifiers.v1.clients.train import ElasticRendererPool, response_from_generate
 from verifiers.v1.configs.client import TrainClientConfig
+
 
 
 def test_generated_call_attempts_keep_original_ordinals_and_sampled_spans():
@@ -243,6 +238,10 @@ def test_qwen35_parser_call_spans_follow_reasoning_and_exclude_stop_suffix():
         def decode(tokens, *, skip_special_tokens=False):
             return bytes(token for token in tokens if token < 256).decode()
 
+        @staticmethod
+        def encode(text, *, add_special_tokens=False):
+            return list(text.encode())
+
     good = list(b"<function=send><parameter=id>1</parameter></function>")
     broken = list(b"malformed")
     original = [
@@ -313,91 +312,25 @@ def test_train_client_config_serializes_selected_chat_template():
     assert restored.chat_template == "selected {{ messages }}"
 
 
-def test_lfm2_parser_recovers_pythonic_tool_call_without_executing_code():
-    content, calls = LFM2ToolParser(LFMTokenizer()).extract([9, 100, 1, 101])
+@pytest.mark.parametrize("reasoning_tokens", [5, 0, None])
+def test_train_response_reports_the_renderer_reasoning_token_count(reasoning_tokens):
+    result = {
+        "request_id": "r1",
+        "prompt_ids": [1, 2, 3],
+        "completion_ids": [10, 11, 12, 13, 14, 15, 16],
+        "completion_logprobs": [-0.1] * 7,
+        "content": "Answer",
+        "reasoning_content": "plan" if reasoning_tokens else None,
+        "reasoning_tokens": reasoning_tokens,
+        "tool_calls": [],
+        "finish_reason": "stop",
+    }
 
-    assert content == [9]
-    assert len(calls) == 1
-    assert calls[0].name == "salesforce_note_create"
-    assert calls[0].arguments == {"parent_id": "001001", "title": "Q1"}
-    assert calls[0].status.value == "ok"
-    assert calls[0].token_span == (1, 4)
+    response = response_from_generate(result, "policy")
 
-
-def test_k2_ifm_parser_recovers_xml_tool_call_from_sampled_tokens():
-    class Tokenizer:
-        @staticmethod
-        def encode(text, *, add_special_tokens):
-            assert add_special_tokens is False
-            return list(text.encode())
-
-        @staticmethod
-        def decode(token_ids, *, skip_special_tokens):
-            assert skip_special_tokens is False
-            return bytes(token_ids).decode()
-
-    raw = (
-        "reasoning</ifm|think><ifm|tool_calls><ifm|tool_call>asana_get_task\n"
-        "<ifm|arg_key>gid</ifm|arg_key><ifm|arg_value>asana_123</ifm|arg_value>"
-        "<ifm|arg_key>limit</ifm|arg_key><ifm|arg_value>2</ifm|arg_value>"
-        "</ifm|tool_call></ifm|tool_calls>"
-    )
-    content, calls = K2IFMToolParser(Tokenizer()).extract(list(raw.encode()))
-
-    assert bytes(content).decode() == "reasoning</ifm|think>"
-    assert len(calls) == 1
-    assert calls[0].name == "asana_get_task"
-    assert calls[0].arguments == {"gid": "asana_123", "limit": 2}
-    assert calls[0].status.value == "ok"
-
-
-def test_k2_ifm_reasoning_parser_preserves_generated_thinking_field():
-    reasoning, content = K2IFMReasoningParser(None).extract(
-        "Inspect the task.</ifm|think><ifm|tool_calls>action</ifm|tool_calls>"
-    )
-
-    assert reasoning == "Inspect the task."
-    assert content == "<ifm|tool_calls>action</ifm|tool_calls>"
-
-
-def test_lfm2_bridge_restores_template_close_after_stripped_stop_token():
-    class Tokenizer:
-        bos_token_id = 5
-        eos_token_id = 7
-
-        @staticmethod
-        def encode(text, *, add_special_tokens):
-            assert text == "\n"
-            assert add_special_tokens is False
-            return [8]
-
-    class Renderer:
-        _tokenizer = Tokenizer()
-
-        @staticmethod
-        def render(messages, *, tools, add_generation_prompt):
-            assert messages == [{"role": "tool", "content": "created"}]
-            assert tools is None
-            assert add_generation_prompt is True
-            from renderers import RenderedTokens
-
-            return RenderedTokens(
-                token_ids=[5, 9, 10],
-                message_indices=[-1, 0, -1],
-                message_roles=["tool"],
-                message_tool_names=[None],
-            )
-
-    bridged = bridge_lfm2_tool_cycle(
-        Renderer(),
-        [1, 2],
-        [3, 4],
-        [{"role": "tool", "content": "created"}],
-    )
-
-    assert bridged is not None
-    assert bridged.token_ids == [1, 2, 3, 4, 7, 8, 9, 10]
-    assert bridged.message_indices == [-1, -1, -1, -1, -1, -1, 0, -1]
+    assert response.usage.prompt_tokens == 3
+    assert response.usage.completion_tokens == 7
+    assert response.usage.reasoning_tokens == reasoning_tokens
 
 
 @pytest.mark.asyncio
