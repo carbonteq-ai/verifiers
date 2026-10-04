@@ -178,9 +178,9 @@ async def test_real_mcp_reserved_metadata_capture_and_rejection_before_handler()
             receipts.append(receipt)
 
         @vf.tool
-        def operation(self, value: str) -> str:
+        def operation(self, value: str, suffix: str = "") -> str:
             entered.append(value)
-            return value
+            return value + suffix
 
     tools = LinkedTools(vf.ToolsetConfig())
     mcp = MCPServer("fixture", middleware=[_execution_metadata_middleware])

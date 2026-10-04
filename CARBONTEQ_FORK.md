@@ -58,7 +58,7 @@ ancestor of this base. Its asynchronous orchestrator uses Verifiers'
 consumer-stamped `TrainWorkInfo.policy: PolicySpan`; Verifiers deliberately
 does not own trainer policy versions or staleness decisions.
 
-### Async-training compatibility boundary
+## Async-training compatibility boundary
 
 Verifiers is compatible with multiple asynchronous trainers through evidence
 and lifecycle primitives; it is not the owner of their scheduling policy.
@@ -204,6 +204,22 @@ keeps the same timeouts; a worker that outlives its own alarm is killed and
 replaced and the answer scores 0.0. Main-thread scoring is unchanged.
 Regression: `test_boxed_math_answer_scores_off_the_main_thread` in
 `tests/v1/test_scoring.py` fails before the change.
+
+### Linked tool-server receipts record the submitted arguments
+
+A linked MCP tool call (one carrying `verifiers.execution` dispatch metadata)
+reaches the server's handler after argument validation has filled every
+omitted optional parameter with its default. The receipt recorded those
+expanded keyword arguments, so `validate_server_parent` rejected it as
+"native server dispatch arguments changed" (HTTP 400) whenever the model left
+an optional argument out, and the tool call failed before running. Posttrain
+smoke run `manifest-steps-smoke-ws-20261005-r6` lost 54 of 57 AutomationBench
+tool calls this way; the 3 that ran supplied every parameter. The metadata
+middleware now keeps the submitted `arguments` for the linked request and the
+receipt records those; unlinked capture is unchanged. Regression:
+`test_real_mcp_reserved_metadata_capture_and_rejection_before_handler` in
+`tests/v1/test_env_server.py` (its tool gains an omitted optional parameter)
+fails before the change.
 
 ## Regression and compatibility
 

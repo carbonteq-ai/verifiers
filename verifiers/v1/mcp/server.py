@@ -10,7 +10,7 @@ import inspect
 import logging
 import os
 from collections.abc import Callable
-from typing import TYPE_CHECKING, ClassVar, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, TypeVar
 from urllib.parse import parse_qs
 
 from pydantic import TypeAdapter, ValidationError
@@ -119,19 +119,30 @@ _request_query_params: contextvars.ContextVar[dict[str, list[str]] | None] = (
 _request_execution: contextvars.ContextVar[DispatchMetadata | None] = (
     contextvars.ContextVar("vf_request_execution", default=None)
 )
+# The linked call's submitted arguments. The handler receives them after
+# argument validation has filled omitted defaults, so a linked receipt records
+# these instead: they are what the dispatch authorized.
+_request_arguments: contextvars.ContextVar[dict[str, Any] | None] = (
+    contextvars.ContextVar("vf_request_arguments", default=None)
+)
 
 
 async def _execution_metadata_middleware(ctx, call_next):
     """Scope reserved MCP metadata to this request, including cancellation paths."""
     metadata = None
+    arguments = None
     if ctx.method == "tools/call" and isinstance(ctx.params, dict):
         meta = ctx.params.get("_meta")
         if isinstance(meta, dict) and EXECUTION_METADATA_KEY in meta:
             metadata = DispatchMetadata.model_validate(meta[EXECUTION_METADATA_KEY])
+            submitted = ctx.params.get("arguments")
+            arguments = dict(submitted) if isinstance(submitted, dict) else {}
     token = _request_execution.set(metadata)
+    arguments_token = _request_arguments.set(arguments)
     try:
         return await call_next(ctx)
     finally:
+        _request_arguments.reset(arguments_token)
         _request_execution.reset(token)
 
 
@@ -351,9 +362,16 @@ class ServerBase(Generic[ConfigT, StateT]):
                 if metadata is not None and not self.execution_capture_enabled():
                     raise ValueError("linked tool execution requires capture enabled")
                 if self.execution_capture_enabled():
+                    submitted = (
+                        _request_arguments.get() if metadata is not None else None
+                    )
                     capture = ExecutionCapture(
                         fn.__name__,
-                        canonical_json({"args": args, "kwargs": kwargs}),
+                        canonical_json(
+                            {"args": [], "kwargs": submitted}
+                            if submitted is not None
+                            else {"args": args, "kwargs": kwargs}
+                        ),
                         revision,
                         **(metadata.model_dump() if metadata is not None else {}),
                         server_name=self.server_name if metadata is not None else None,
