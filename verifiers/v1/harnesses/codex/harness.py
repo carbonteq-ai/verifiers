@@ -14,6 +14,7 @@ from verifiers.v1.harnesses.utils.install import ensure_installed, remove_dir
 from verifiers.v1.runtimes import Runtime
 from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
+from verifiers.v1.types import TextContentPart
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +87,32 @@ class CodexHarness(ACPHarness[CodexHarnessConfig]):
         mcp_urls: dict[str, str],
         data: TaskData,
     ) -> ACPConfig:
-        if data.system_prompt is not None and not isinstance(data.prompt, str):
-            system_prompt, prompt = data.system_prompt, data.prompt
+        if isinstance(data.prompt, list):
+            # ACP carries this as labelled initial user text, not a provider
+            # system role. Initial task messages may still declare that text.
+            systems = [] if data.system_prompt is None else [data.system_prompt]
+            first_user = 0
+            for message in data.prompt:
+                if message.role != "system":
+                    break
+                content = message.content
+                if isinstance(content, str):
+                    systems.append(content)
+                elif isinstance(content, list) and all(
+                    isinstance(part, TextContentPart) for part in content
+                ):
+                    systems.append("".join(part.text for part in content))
+                else:
+                    raise ValueError(
+                        "Codex initial system messages must contain text only"
+                    )
+                first_user += 1
+            prompt = data.prompt[first_user:]
+            if not prompt or any(message.role != "user" for message in prompt):
+                raise ValueError(
+                    "Codex initial prompt requires user messages after optional leading system messages"
+                )
+            system_prompt = "\n\n".join(systems) if systems else None
         else:
             system_prompt, prompt = self.resolve_prompt(data)
         env = await self.build_env(ctx, trace, runtime, endpoint, secret, mcp_urls)
@@ -120,13 +145,32 @@ class CodexHarness(ACPHarness[CodexHarnessConfig]):
         mcp_urls: dict[str, str],
     ) -> dict[str, str]:
         home = self.trace_home(trace)
+        # Codex rejects empty or punctuation-bearing server names. Reserve valid
+        # names first so aliases never displace a caller's already valid name.
+        aliases = {
+            name: name
+            for name in sorted(mcp_urls)
+            if re.fullmatch(r"[a-zA-Z0-9_-]+", name)
+        }
+        reserved = set(aliases.values())
+        for name in sorted(set(mcp_urls) - set(aliases)):
+            base = f"vf_mcp_{hashlib.sha256(name.encode()).hexdigest()[:12]}"
+            alias = base
+            suffix = 1
+            while alias in reserved:
+                alias = f"{base}_{suffix}"
+                suffix += 1
+            aliases[name] = alias
+            reserved.add(alias)
+        normalized_urls = {aliases[name]: mcp_urls[name] for name in sorted(mcp_urls)}
+        trace.info["codex_mcp_server_aliases"] = dict(sorted(aliases.items()))
         mcp_config = "features={mcp_2026_07_28=true}\n" + (
             "mcp_servers={"
             + ",".join(
                 f"{json.dumps(name, ensure_ascii=False)}="
                 f"{{url={json.dumps(url, ensure_ascii=False)},required=true,"
                 f"startup_timeout_sec=60.0,tool_timeout_sec={self.config.tool_timeout}}}"
-                for name, url in mcp_urls.items()
+                for name, url in normalized_urls.items()
             )
             + "}"
             if mcp_urls
@@ -136,7 +180,7 @@ class CodexHarness(ACPHarness[CodexHarnessConfig]):
 
         namespace_bases = {
             name: (namespace if namespace.startswith("mcp__") else f"mcp__{namespace}")
-            for name in mcp_urls
+            for name in normalized_urls
             for namespace in (re.sub(r"[^a-zA-Z0-9_]", "_", name) or "_",)
         }
         namespace_counts = Counter(namespace_bases.values())

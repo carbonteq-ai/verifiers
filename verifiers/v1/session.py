@@ -9,20 +9,29 @@ budget (turns / tokens), checked between turns.
 
 import asyncio
 import inspect
+import json
 import logging
 from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from functools import cached_property
 from typing import get_origin, get_type_hints
+from uuid import uuid4
 
 from pydantic import TypeAdapter
 
 from verifiers.v1 import graph
+from verifiers.v1.assessments import canonical_json
 from verifiers.v1.clients import Client, ModelContext
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.errors import RolloutError, TaskError
-from verifiers.v1.trace import InterceptRecord, Trace
+from verifiers.v1.trace import (
+    InterceptRecord,
+    ToolExecutionEvent,
+    ToolServerExecutionEvent,
+    Trace,
+    validate_tool_server_state_ack,
+)
 from verifiers.v1.types import (
     AssistantMessage,
     Messages,
@@ -30,6 +39,7 @@ from verifiers.v1.types import (
     Response,
     ToolMessage,
     UserMessage,
+    generated_arguments_equal,
 )
 from verifiers.v1.utils.decorators import invoke
 
@@ -147,6 +157,86 @@ class RolloutSession:
     the exchange (upstream call, simulator turn) — unregistering cancels these instead."""
     prepared_tool_results: dict[str, ToolMessage] = field(default_factory=dict)
     prepared_users: Counter[str] = field(default_factory=Counter)
+    tool_receipt_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+
+    @property
+    def state_revision(self) -> int:
+        return self.trace.tool_state_revision
+
+    @state_revision.setter
+    def state_revision(self, value: int) -> None:
+        self.trace.tool_state_revision = value
+
+    def retain_tool_server_receipt(self, receipt):
+        """Synchronously acknowledge one immutable server report; never assign action credit."""
+        from verifiers.v1.mcp.execution import ToolServerReceipt
+
+        receipt = ToolServerReceipt.model_validate(
+            receipt.model_dump(mode="python"), strict=True
+        )
+        if self.released:
+            raise TaskError("tool-server receipt arrived after rollout was sealed")
+        from verifiers.v1._execution_links import validate_server_parent
+
+        validate_server_parent(
+            receipt, self.trace.tool_execution_events, self.trace.nodes
+        )
+        validate_tool_server_state_ack(receipt, self.trace.state_write_receipts)
+        if any(
+            value is not None and value > self.state_revision
+            for value in (receipt.state_read_revision, receipt.state_write_revision)
+        ):
+            raise TaskError("tool-server receipt reports a future state revision")
+        payload = canonical_json(receipt.model_dump(mode="json"))
+        previous = [
+            item
+            for item in self.trace.tool_execution_events
+            if isinstance(item, ToolServerExecutionEvent)
+            and item.invocation_id == receipt.invocation_id
+        ]
+        for item in previous:
+            if item.event_index == receipt.event_index:
+                if item.receipt_json != payload:
+                    raise TaskError("conflicting duplicate tool-server receipt")
+                return {
+                    "ok": True,
+                    "receipt_seq": item.receipt_seq,
+                    "state_revision": item.state_revision,
+                }
+        if (not previous and receipt.phase != "dispatch") or (
+            previous and (len(previous) != 1 or receipt.event_index != 1)
+        ):
+            raise TaskError("invalid tool-server execution lifecycle")
+        if previous:
+            original = json.loads(previous[0].receipt_json)
+            current = receipt.model_dump(mode="json")
+            if any(
+                original.get(key) != current.get(key)
+                for key in (
+                    "tool_name",
+                    "arguments_json",
+                    "state_read_revision",
+                    "parent_execution_id",
+                    "dispatch_ticket",
+                    "transport_attempt_index",
+                    "server_name",
+                )
+            ):
+                raise TaskError("tool-server execution changed invocation identity")
+        item = ToolServerExecutionEvent(
+            invocation_id=receipt.invocation_id,
+            event_index=receipt.event_index,
+            phase=receipt.phase,
+            receipt_seq=len(self.trace.tool_execution_events),
+            state_revision=self.state_revision,
+            receipt_json=payload,
+        )
+        self.trace.tool_execution_events += (item,)
+        return {
+            "ok": True,
+            "receipt_seq": item.receipt_seq,
+            "state_revision": item.state_revision,
+        }
 
     @property
     def stopped(self) -> bool:
@@ -320,7 +410,156 @@ class RolloutSession:
             ) from error
         return response, records, None
 
-    async def handle_tool(self, phase: str, message: ToolMessage) -> dict:
+    async def handle_tool(
+        self, phase: str, message: ToolMessage, *, request=None
+    ) -> dict:
+        """Retain occurrence-bound receipts; duplicate deliveries never replay hooks."""
+        from verifiers.v1.interception.tool import ToolHookRequest
+
+        hook = ToolHookRequest.model_validate(
+            (request or ToolHookRequest(phase=phase, message=message)).model_dump(
+                mode="python"
+            ),
+            strict=True,
+        )
+        if hook.phase != phase or hook.message != message:
+            raise TaskError("tool receipt arguments disagree with payload")
+        if self.released:
+            raise TaskError("tool receipt arrived after rollout was sealed")
+        if hook.execution_id is None:
+            return await self._handle_tool_policy(phase, message)
+        lock = self.tool_receipt_locks.setdefault(hook.execution_id, asyncio.Lock())
+        async with lock:
+            if self.released:
+                raise TaskError("tool receipt arrived after rollout was sealed")
+            payload = canonical_json(hook.model_dump(mode="json"))
+            previous = [
+                event
+                for event in self.trace.tool_execution_events
+                if isinstance(event, ToolExecutionEvent)
+                and event.execution_id == hook.execution_id
+            ]
+            for event in previous:
+                if event.event_index == hook.event_index:
+                    if event.request_json != payload:
+                        raise TaskError("conflicting duplicate tool execution receipt")
+                    return json.loads(event.decision_json)
+            frontier = {
+                id(branch.nodes[-1]) for branch in self.trace.branches if branch.nodes
+            }
+            matches = [
+                (index, ordinal, node)
+                for index, node in enumerate(self.trace.nodes)
+                if isinstance(node.message, AssistantMessage)
+                and (
+                    index == previous[0].node_index
+                    if previous
+                    else id(node) in frontier
+                )
+                for ordinal, call in enumerate(node.message.tool_calls or [])
+                if call.id == hook.call.id
+                and (ordinal == previous[0].emitted_call_index if previous else True)
+            ]
+            if len(matches) != 1:
+                raise TaskError(
+                    "tool execution must match one unique native emitted call"
+                )
+            node_index, ordinal, node = matches[0]
+            emitted = node.message.tool_calls[ordinal]
+            if (
+                emitted.name != hook.call.name
+                or emitted.type != hook.call.type
+                or not generated_arguments_equal(emitted.arguments, hook.call.arguments)
+            ):
+                raise TaskError(
+                    "tool execution payload disagrees with native emitted call"
+                )
+            expected = 0 if not previous else previous[-1].event_index + 1
+            if hook.event_index != expected:
+                raise TaskError(
+                    "tool execution receipts must have contiguous event indices"
+                )
+            if not previous:
+                allowed = hook.phase == "before"
+            elif previous[-1].phase == "before":
+                allowed = hook.phase in ("dispatch", "rejected")
+                if json.loads(previous[-1].decision_json).get("action") != "allow":
+                    allowed = False
+            elif previous[-1].phase == "dispatch":
+                allowed = hook.phase in ("after", "raised", "interrupted")
+            else:
+                allowed = False
+            if not allowed:
+                raise TaskError("invalid tool execution lifecycle transition")
+            if previous and (
+                previous[0].node_index,
+                previous[0].emitted_call_index,
+            ) != (node_index, ordinal):
+                raise TaskError("tool execution occurrence changed its native target")
+            attempts = [
+                attempt.attempt_index
+                for attempt in node.generated_calls
+                if attempt.emitted_call_index == ordinal and node.sampled
+            ]
+            generated_index = (
+                previous[0].generated_attempt_index
+                if previous
+                else attempts[0]
+                if len(attempts) == 1
+                else None
+            )
+            if (
+                previous
+                and generated_index is not None
+                and attempts != [generated_index]
+            ):
+                raise TaskError(
+                    "tool execution generated attribution changed during occurrence"
+                )
+
+            def retain(decision):
+                if self.released:
+                    return
+                event = ToolExecutionEvent(
+                    execution_id=hook.execution_id,
+                    event_index=hook.event_index,
+                    phase=hook.phase,
+                    receipt_seq=len(self.trace.tool_execution_events),
+                    node_index=node_index,
+                    emitted_call_index=ordinal,
+                    generated_attempt_index=generated_index,
+                    request_json=payload,
+                    decision_json=canonical_json(decision),
+                )
+                self.trace.tool_execution_events += (event,)
+
+            try:
+                decision = (
+                    await self._handle_tool_policy(
+                        "after" if phase == "rejected" else phase, message
+                    )
+                    if phase in ("before", "after", "rejected")
+                    else {"action": "allow"}
+                )
+            except asyncio.CancelledError:
+                retain({"action": "incomplete", "reason": "interceptor_cancelled"})
+                raise
+            except Exception as error:
+                retain({"action": "error", "error": f"{type(error).__name__}: {error}"})
+                raise
+            if self.released:
+                raise TaskError("tool receipt finished after rollout was sealed")
+            if hook.mcp_dispatch is not None:
+                from verifiers.v1._execution_links import validate_dispatch_call
+
+                validate_dispatch_call(hook)
+                if node.sampled is not True:
+                    raise TaskError("MCP dispatch must target an original sampled call")
+                decision = {**decision, "mcp_dispatch_ticket": uuid4().hex}
+            retain(decision)
+            return decision
+
+    async def _handle_tool_policy(self, phase: str, message: ToolMessage) -> dict:
         """Intercept a harness-owned tool result before the harness records it."""
         branches = [
             branch
@@ -352,6 +591,8 @@ class RolloutSession:
                 tools=self.trace.tools or None,
             )
         )
+        if self.released:
+            raise TaskError("tool policy finished after rollout was sealed")
         candidate = request.messages[-1]
         assert isinstance(candidate, ToolMessage)
         self.trace.request_rewrites.extend(records)

@@ -12,7 +12,7 @@ import logging
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, replace
-from typing import Self
+from typing import Literal, Self
 
 from verifiers.v1.clients import (
     EvalClientConfig,
@@ -306,6 +306,7 @@ class Agent:
         # Env-owned standing, not config: `Env.setup` marks fixed agents
         # untrainable and traces are stamped from here; inert outside an env.
         self.trainable: bool = True
+        self.execution_purpose: Literal["solver", "assessment"] = "solver"
         self._entered = False
         self._server: InterceptionServer | None = None
         self._warned_resources: set[tuple[str, str]] = set()
@@ -427,6 +428,19 @@ class Agent:
             trace.errors = history + trace.errors
         return trace
 
+    def _watch_standing(
+        self, on_trace: Callable[[Trace], None] | None
+    ) -> Callable[[Trace], None]:
+        """Stamp declared standing before observers or scoring see a minted trace."""
+
+        def watch(trace: Trace) -> None:
+            trace.agent.trainable = self.trainable
+            trace.agent.execution_purpose = self.execution_purpose
+            if on_trace is not None:
+                on_trace(trace)
+
+        return watch
+
     async def _run_once(
         self,
         task: Task,
@@ -443,7 +457,7 @@ class Agent:
             )
         run = Rollout(
             task=task,
-            on_trace=on_trace,
+            on_trace=self._watch_standing(on_trace),
             collect_artifacts=collect_artifacts,
             **params,
         )
@@ -503,7 +517,7 @@ class Agent:
         run = Rollout(
             task=task,
             has_user=True,
-            on_trace=on_trace,
+            on_trace=self._watch_standing(on_trace),
             **params,
         )
         interaction = Interaction(run, gate=self._gate)
@@ -625,6 +639,7 @@ class _EpisodeAgent(Agent):
             if trace.agent is not None:
                 trace.agent.name = self._name
                 trace.agent.trainable = self.trainable
+                trace.agent.execution_purpose = self.execution_purpose
             # A per-agent retry mints a replacement: the abandoned attempt's trace
             # must leave live views (only the final one joins the episode).
             if last is not None and self._on_discard is not None:

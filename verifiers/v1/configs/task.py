@@ -50,6 +50,15 @@ class TaskConfig(BaseConfig):
     """Weighted rewards `(task, trace, runtime) -> float` plugged by name, merged with
     the task's `@vf.reward` methods."""
 
+    assessments: dict[str, DecoratedFunctionConfig] = Field(default_factory=dict)
+    """Assessment hooks returning native evidence, without adding scalar reward."""
+    credit_rules: dict[str, DecoratedFunctionConfig] = Field(default_factory=dict)
+    """Native domain assignment hooks; no advantage estimation or scalar reduction."""
+    max_concurrent_assessments: int = Field(default=4, ge=1)
+    """Per-trace bound on independent, read-only assessment invocations.
+    Provider-wide concurrency and cost limits remain enforced by the client.
+    """
+
     @model_validator(mode="before")
     @classmethod
     def _resolve_judges(cls, data):

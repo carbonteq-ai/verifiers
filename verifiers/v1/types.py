@@ -1,9 +1,18 @@
+import hashlib
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Self
 
 import numpy as np
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    model_validator,
+)
 from renderers.base import MultiModalData
 from typing_extensions import TypedDict
 
@@ -69,7 +78,180 @@ class ToolCall(BaseModel):
     type: Literal["function", "custom"] = "function"
     name: str
     arguments: str
-    """Raw function arguments or custom-tool input, exactly as the model emitted it."""
+    """Provider arguments or parser output passed to dispatch. GeneratedCallAttempt.raw
+    retains original generated syntax when a renderer normalizes arguments."""
+
+
+def generated_completion_digest(token_ids: Iterable[int]) -> str:
+    """Hash original completion tokens, without rendering or normalizing their text."""
+    retained = list(token_ids)
+    if any(type(token) is not int for token in retained):
+        raise ValueError("generated completion identity requires integer token IDs")
+    encoded = json.dumps(
+        retained, separators=(",", ":"), ensure_ascii=False, allow_nan=False
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+class GeneratedCallProducer(BaseModel):
+    """Inspectable parser provenance; a descriptor does not establish span exactness."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    parser_revision: str = Field(min_length=1)
+    descriptor_json: str
+    descriptor_digest: str = Field(min_length=1)
+
+    @classmethod
+    def capture(cls, parser_revision: str, descriptor: dict[str, Any]) -> Self:
+        encoded = json.dumps(
+            descriptor,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        return cls(
+            parser_revision=parser_revision,
+            descriptor_json=encoded,
+            descriptor_digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+        )
+
+    @model_validator(mode="after")
+    def verify(self) -> Self:
+        decoded = json.loads(self.descriptor_json)
+        if not isinstance(decoded, dict):
+            raise ValueError("generated-call producer descriptor must be a JSON object")  # noqa: TRY004
+        canonical = json.dumps(
+            decoded,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+        if canonical != self.descriptor_json:
+            raise ValueError(
+                "generated-call producer descriptor must be canonical JSON"
+            )
+        if (
+            hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+            != self.descriptor_digest
+        ):
+            raise ValueError("generated-call producer descriptor digest mismatch")
+        return self
+
+
+class GeneratedCallAttempt(BaseModel):
+    """One parser-observed generated action, independent of dispatch or execution."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    attempt_index: int = Field(ge=0, strict=True)
+    emitted_call_index: int | None = Field(default=None, ge=0, strict=True)
+    provider_call_id: str | None = None
+    parse_status: str = Field(min_length=1)
+    raw: str
+    name: str | None = None
+    arguments: str | None = None
+    token_span: tuple[StrictInt, StrictInt] | None = None
+    coordinate_system: Literal["completion", "node_local_full_tokens"]
+    parser_revision: str = Field(min_length=1)
+    span_fidelity: Literal["exact", "joint", "unavailable"]
+    completion_token_digest: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def verify(self) -> Self:
+        if self.token_span is not None:
+            start, end = self.token_span
+            if start < 0 or end <= start:
+                raise ValueError(
+                    "generated-call span must be a nonempty half-open interval"
+                )
+        if self.span_fidelity == "unavailable":
+            if self.token_span is not None:
+                raise ValueError(
+                    "unavailable generated-call support cannot carry a span"
+                )
+        elif self.token_span is None:
+            raise ValueError(
+                "exact/joint generated-call support requires a retained span"
+            )
+        return self
+
+
+def generated_arguments_equal(first: str | None, second: str | None) -> bool:
+    """Compare JSON argument meaning without replacing retained original strings.
+
+    JSON encoding preserves booleans versus numbers; Python value equality does not.
+    Non-JSON custom or malformed input is comparable only by its exact raw string.
+    """
+    first = first if first is not None else "{}"
+    second = second if second is not None else "{}"
+    try:
+        first_json = json.dumps(
+            json.loads(first), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+        second_json = json.dumps(
+            json.loads(second), sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (ValueError, TypeError):
+        return first == second
+    return first_json == second_json
+
+
+def validate_generated_call_links(
+    attempts: tuple[GeneratedCallAttempt, ...],
+    tool_calls: list[ToolCall] | tuple[ToolCall, ...] | None,
+) -> None:
+    """Verify parser-attempt correlation with emitted messages, not execution."""
+    emitted = tool_calls or ()
+    used: set[int] = set()
+    for item in attempts:
+        attempt = GeneratedCallAttempt.model_validate(item.model_dump(mode="json"))
+        index = attempt.emitted_call_index
+        if index is None:
+            continue
+        if index in used or index >= len(emitted):
+            raise ValueError(
+                "generated-call emitted index is duplicate or out of bounds"
+            )
+        used.add(index)
+        call = emitted[index]
+        if call.type != "function":
+            raise ValueError(
+                "generated function attempt cannot link to a custom emitted call"
+            )
+        if attempt.name != call.name:
+            raise ValueError("generated-call name does not match emitted call")
+        if not generated_arguments_equal(attempt.arguments, call.arguments):
+            raise ValueError("generated-call arguments do not match emitted call")
+        if attempt.provider_call_id is not None and attempt.provider_call_id != call.id:
+            raise ValueError(
+                "generated-call provider identity does not match emitted call"
+            )
+
+
+def validate_generated_call_spans(attempts: tuple[GeneratedCallAttempt, ...]) -> None:
+    """Exact support is isolated; jointly attributed parser spans may overlap."""
+    validated = tuple(
+        GeneratedCallAttempt.model_validate(item.model_dump(mode="json"))
+        for item in attempts
+    )
+    for index, left in enumerate(validated):
+        if left.token_span is None:
+            continue
+        for right in validated[index + 1 :]:
+            if right.token_span is None:
+                continue
+            if left.coordinate_system != right.coordinate_system:
+                raise ValueError("generated-call span coordinates cannot be mixed")
+            overlap = max(left.token_span[0], right.token_span[0]) < min(
+                left.token_span[1], right.token_span[1]
+            )
+            if overlap and "exact" in {left.span_fidelity, right.span_fidelity}:
+                raise ValueError(
+                    "exact generated-call span overlaps another generated attempt"
+                )
 
 
 class AssistantMessage(BaseModel):
@@ -218,6 +400,11 @@ class TurnTokens(BaseModel):
     prompt_ids: list[int] = Field(default_factory=list)
     completion_ids: list[int] = Field(default_factory=list)
     completion_logprobs: list[float] = Field(default_factory=list)
+    # Original parser attempts are transferred to the committed assistant node.
+    generated_calls: tuple[GeneratedCallAttempt, ...] = Field(default=(), exclude=True)
+    generated_call_producer: GeneratedCallProducer | None = Field(
+        default=None, exclude=True
+    )
 
     # Transient carrier (excluded): per-message token spans into `prompt_ids` from the renderer,
     # consumed by the turn's `commit` to attribute tokens per message, then dropped.

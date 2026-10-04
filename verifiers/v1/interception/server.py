@@ -63,7 +63,13 @@ from verifiers.v1.interception.tunnel import (
 )
 from verifiers.v1.semantic import ACPInfo, extract_acp_info
 from verifiers.v1.session import IdempotentRequest, ReplayResponse, RolloutSession
-from verifiers.v1.trace import Error, ModelCall, PolicyEvent, TimeSpan
+from verifiers.v1.trace import (
+    Error,
+    ModelCall,
+    PolicyEvent,
+    StateWriteReceipt,
+    TimeSpan,
+)
 from verifiers.v1.types import FinishReason, Request, Response, Usage
 
 logger = logging.getLogger(__name__)
@@ -336,6 +342,7 @@ class InterceptionServer(Interception):
         # Tool servers use a state-only capability; the model bearer cannot reach these.
         app.router.add_get("/state", self.handle_state_get)
         app.router.add_put("/state", self.handle_state_put)
+        app.router.add_post("/tool-execution", self.handle_tool_execution)
         app.router.add_post("/tool", self.handle_tool)
         # A launched tool server fetches its rollout's task here to run `setup_task` — the task
         # is never passed via env, only over this channel, keyed by the state bearer.
@@ -410,10 +417,12 @@ class InterceptionServer(Interception):
         try:
             hook = ToolHookRequest.model_validate_json(await request.read())
             return web.json_response(
-                await session.handle_tool(hook.phase, hook.message)
+                await session.handle_tool(hook.phase, hook.message, request=hook)
             )
         except RolloutError as error:
             session.error = error
+            return web.json_response({"error": str(error)}, status=400)
+        except ValueError as error:
             return web.json_response({"error": str(error)}, status=400)
 
     def record_call(
@@ -1133,6 +1142,8 @@ class InterceptionServer(Interception):
         session = self._session_for(request, allow_service=True)
         if session is None:
             return web.json_response({"error": "unauthorized"}, status=401)
+        if session.released:
+            return web.json_response({"error": "rollout concluded"}, status=409)
         logger.debug("intercept GET /state: id=%s", session.trace.id)
         state = session.trace.state
         return web.Response(
@@ -1140,6 +1151,7 @@ class InterceptionServer(Interception):
             body=session.state_adapter.dump_json(state),
             content_type="application/json",
             charset="utf-8",
+            headers={"X-Verifiers-State-Revision": str(session.state_revision)},
         )
 
     async def handle_task_get(self, request: web.Request) -> web.Response:
@@ -1178,5 +1190,96 @@ class InterceptionServer(Interception):
             )
         if session.released:  # the trace is sealed — a straggler write must not land
             return web.json_response({"error": "rollout concluded"}, status=409)
+        expected = request.headers.get("X-Verifiers-State-Expected-Revision")
+        if expected is not None and (not expected.isdecimal()):
+            return web.json_response(
+                {"error": "invalid expected state revision"}, status=400
+            )
+        conflict = expected is not None and int(expected) != session.state_revision
+        write_id = request.headers.get("X-Verifiers-State-Write-ID")
+        expected_revision = int(expected) if expected is not None else None
+        if expected_revision is not None and expected_revision > session.state_revision:
+            return web.json_response(
+                {"error": "future expected state revision"}, status=400
+            )
+        if write_id is not None:
+            from verifiers.v1.assessments import content_digest
+
+            if not write_id:
+                return web.json_response(
+                    {"error": "empty state write identity"}, status=400
+                )
+            body_digest = content_digest(json.loads(raw))
+            for previous in session.trace.state_write_receipts:
+                if previous.write_id == write_id:
+                    if (previous.body_digest, previous.expected_revision) != (
+                        body_digest,
+                        expected_revision,
+                    ):
+                        return web.json_response(
+                            {"error": "conflicting duplicate state write"}, status=409
+                        )
+                    return web.json_response(
+                        {"ok": True},
+                        headers={
+                            "X-Verifiers-State-Revision": str(
+                                previous.applied_revision
+                            ),
+                            "X-Verifiers-State-Conflict": "true"
+                            if previous.conflict
+                            else "false",
+                        },
+                    )
         session.trace.state = new_state
-        return web.json_response({"ok": True})
+        session.state_revision += 1
+        if write_id is not None:
+            session.trace.state_write_receipts += (
+                StateWriteReceipt(
+                    write_id=write_id,
+                    body_digest=body_digest,
+                    expected_revision=expected_revision,
+                    applied_revision=session.state_revision,
+                    conflict=conflict,
+                ),
+            )
+        return web.json_response(
+            {"ok": True},
+            headers={
+                "X-Verifiers-State-Revision": str(session.state_revision),
+                "X-Verifiers-State-Conflict": "true" if conflict else "false",
+            },
+        )
+
+    async def handle_tool_execution(self, request: web.Request) -> web.Response:
+        from verifiers.v1.mcp.execution import (
+            MAX_EXECUTION_RECEIPT_BYTES,
+            ToolServerReceipt,
+        )
+
+        session = self._session_for(request, allow_service=True)
+        if session is None:
+            return web.json_response({"error": "unauthorized"}, status=401)
+        if session.released:
+            return web.json_response({"error": "rollout concluded"}, status=409)
+        if (
+            request.content_length is not None
+            and request.content_length > MAX_EXECUTION_RECEIPT_BYTES
+        ):
+            return web.json_response(
+                {"error": "tool execution receipt too large"}, status=413
+            )
+        raw = bytearray()
+        async for chunk in request.content.iter_chunked(65536):
+            if len(raw) + len(chunk) > MAX_EXECUTION_RECEIPT_BYTES:
+                return web.json_response(
+                    {"error": "tool execution receipt too large"}, status=413
+                )
+            raw.extend(chunk)
+        if session.released:
+            return web.json_response({"error": "rollout concluded"}, status=409)
+        try:
+            receipt = ToolServerReceipt.model_validate_json(raw)
+            acknowledgement = session.retain_tool_server_receipt(receipt)
+        except (ValueError, RolloutError) as error:
+            return web.json_response({"error": str(error)}, status=400)
+        return web.json_response(acknowledgement)

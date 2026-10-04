@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import contextvars
 import functools
@@ -15,6 +16,20 @@ from urllib.parse import parse_qs
 from pydantic import TypeAdapter, ValidationError
 from pydantic_config import BaseConfig
 
+from verifiers.v1.assessments import canonical_json
+from verifiers.v1.mcp.execution import (
+    EXECUTION_METADATA_KEY,
+    MAX_EXECUTION_RECEIPT_BYTES,
+    STATE_CONFLICT_HEADER,
+    STATE_EXPECTED_REVISION_HEADER,
+    STATE_REVISION_HEADER,
+    STATE_WRITE_ID_HEADER,
+    DispatchMetadata,
+    ExecutionCapture,
+    StateRevision,
+    active_execution,
+    active_revision,
+)
 from verifiers.v1.state import State, StateT, state_cls
 from verifiers.v1.utils.generic import concrete_type
 
@@ -38,6 +53,7 @@ async def _channel_request(
     route: str | None = None,
     content: bytes | None = None,
     client: AsyncClient | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> Response:
     """Retry tunnel transport errors and 5xx responses, but not invalid 4xx requests."""
     import httpx
@@ -61,6 +77,7 @@ async def _channel_request(
         )
         async with manager as request_client:
             headers = {"Authorization": f"Bearer {secret}"}
+            headers.update(extra_headers or {})
             if route:
                 headers["X-Verifiers-State-Route"] = route
             if content is not None:
@@ -99,6 +116,23 @@ _call_state: contextvars.ContextVar[State | None] = contextvars.ContextVar(
 _request_query_params: contextvars.ContextVar[dict[str, list[str]] | None] = (
     contextvars.ContextVar("vf_request_query_params", default=None)
 )
+_request_execution: contextvars.ContextVar[DispatchMetadata | None] = (
+    contextvars.ContextVar("vf_request_execution", default=None)
+)
+
+
+async def _execution_metadata_middleware(ctx, call_next):
+    """Scope reserved MCP metadata to this request, including cancellation paths."""
+    metadata = None
+    if ctx.method == "tools/call" and isinstance(ctx.params, dict):
+        meta = ctx.params.get("_meta")
+        if isinstance(meta, dict) and EXECUTION_METADATA_KEY in meta:
+            metadata = DispatchMetadata.model_validate(meta[EXECUTION_METADATA_KEY])
+    token = _request_execution.set(metadata)
+    try:
+        return await call_next(ctx)
+    finally:
+        _request_execution.reset(token)
 
 
 def _request_query(name: str) -> str | None:
@@ -129,6 +163,7 @@ def _import_ref(ref: str) -> object:
 
 
 class ServerBase(Generic[ConfigT, StateT]):
+    CAPTURE_EXECUTIONS: ClassVar[bool] = False
     TOOL_PREFIX: ClassVar[str | None] = ""
     """The empty value falls back to the snake-cased class name. None advertises the server's
     tools bare (no `<server>_` prefix); name collisions across servers are then the taskset
@@ -173,6 +208,9 @@ class ServerBase(Generic[ConfigT, StateT]):
         response = await _channel_request(
             "GET", url, secret, route=route, client=self._state_client
         )
+        revision = active_revision.get()
+        if revision is not None and STATE_REVISION_HEADER in response.headers:
+            revision.read = int(response.headers[STATE_REVISION_HEADER])
         try:
             return self._state_adapter.validate_json(response.content)
         except ValidationError as e:
@@ -189,15 +227,87 @@ class ServerBase(Generic[ConfigT, StateT]):
         current = state if state is not None else self._inert_state
         after = self._state_adapter.dump_json(current)
         if after == before:
+            if (revision := active_revision.get()) is not None:
+                revision.persistence = "unchanged"
             return
-        await _channel_request(
+        revision = active_revision.get()
+        write_headers = {}
+        if revision is not None and revision.read is not None:
+            write_headers[STATE_EXPECTED_REVISION_HEADER] = str(revision.read)
+        if (capture := active_execution.get()) is not None:
+            write_headers[STATE_WRITE_ID_HEADER] = capture.invocation_id
+        response = await _channel_request(
             "PUT",
             url,
             secret,
             route=route,
             content=after,
             client=self._state_client,
+            extra_headers=write_headers,
         )
+        if revision is not None:
+            revision.persistence = "unknown"
+            if STATE_REVISION_HEADER in response.headers:
+                revision.written = int(response.headers[STATE_REVISION_HEADER])
+                revision.persistence = "applied"
+            if (
+                STATE_CONFLICT_HEADER in response.headers
+                and revision.written is not None
+            ):
+                revision.conflict = response.headers[STATE_CONFLICT_HEADER] == "true"
+
+    def execution_capture_enabled(self) -> bool:
+        """Override after state pull to select capture without exposing a tool argument."""
+        return self.CAPTURE_EXECUTIONS
+
+    async def _emit_execution_receipt(self, receipt) -> None:
+        from verifiers.v1.mcp.execution import ToolServerReceipt
+
+        receipt = ToolServerReceipt.model_validate(
+            receipt.model_dump(mode="python"), strict=True
+        )
+        encoded = canonical_json(receipt.model_dump(mode="json")).encode("utf-8")
+        if len(encoded) > MAX_EXECUTION_RECEIPT_BYTES:
+            raise ValueError("tool execution receipt exceeds bounded transport size")
+        url, secret, route = self._state_channel()
+        if not url or not url.endswith("/state"):
+            raise ValueError(
+                "tool execution capture requires an authenticated /state channel"
+            )
+        response = await _channel_request(
+            "POST",
+            url[: -len("/state")] + "/tool-execution",
+            secret,
+            route=route,
+            content=encoded,
+            client=self._state_client,
+        )
+        ack = response.json()
+        if ack.get("ok") is not True or type(ack.get("receipt_seq")) is not int:
+            raise ValueError("tool execution receipt was not acknowledged")
+
+    async def _report_secondary_failure(
+        self, capture, phase, primary, *, result=None, state_error=None
+    ) -> None:
+        """Capture failure is secondary to the original tool/cancellation/state exception."""
+        try:
+            await self._emit_execution_receipt(
+                capture.receipt(
+                    phase,
+                    result=result,
+                    error=primary if phase != "returned" else None,
+                    state_error=state_error,
+                )
+            )
+        except BaseException as secondary:  # noqa: BLE001 - preserve the already active primary failure
+            primary.add_note(
+                f"Secondary tool-execution capture failure: {type(secondary).__name__}: {secondary}"
+            )
+            logger.warning(
+                "tool-execution capture failed while preserving primary %s: %s",
+                type(primary).__name__,
+                type(secondary).__name__,
+            )
 
     async def _fetch_task(self, state_url: str | None, secret: str):
         """Fetch the rollout task; shared task-agnostic servers have no task channel."""
@@ -229,18 +339,70 @@ class ServerBase(Generic[ConfigT, StateT]):
         async def wrapper(*args, **kwargs):
             # Base State has no fields and rejects extras, so only subclasses need channel sync.
             sync_state = self._state_cls is not State
-            state = await self._pull_state() if sync_state else State()
-            token = _call_state.set(state)
+            revision = StateRevision()
+            revision_token = active_revision.set(revision)
+            token = None
+            capture_token = None
             try:
+                state = await self._pull_state() if sync_state else State()
+                token = _call_state.set(state)
+                capture = None
+                metadata = _request_execution.get()
+                if metadata is not None and not self.execution_capture_enabled():
+                    raise ValueError("linked tool execution requires capture enabled")
+                if self.execution_capture_enabled():
+                    capture = ExecutionCapture(
+                        fn.__name__,
+                        canonical_json({"args": args, "kwargs": kwargs}),
+                        revision,
+                        **(metadata.model_dump() if metadata is not None else {}),
+                        server_name=self.server_name if metadata is not None else None,
+                    )
+                    capture_token = active_execution.set(capture)
+                    await self._emit_execution_receipt(capture.receipt("dispatch"))
                 before = self._state_adapter.dump_json(state) if sync_state else None
-                result = fn(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = await result
-                if before is not None:
-                    await self._push_state(before)
+                try:
+                    result = fn(*args, **kwargs)
+                    if inspect.isawaitable(result):
+                        result = await result
+                except asyncio.CancelledError as error:
+                    if capture is not None:
+                        await self._report_secondary_failure(
+                            capture, "interrupted", error
+                        )
+                    raise
+                except Exception as error:
+                    if capture is not None:
+                        await self._report_secondary_failure(capture, "raised", error)
+                    raise
+                try:
+                    if before is not None:
+                        await self._push_state(before)
+                except BaseException as error:
+                    import httpx
+
+                    revision.persistence = (
+                        "failed"
+                        if isinstance(error, httpx.HTTPStatusError)
+                        and 400 <= error.response.status_code < 500
+                        else "unknown"
+                    )
+                    if capture is not None:
+                        await self._report_secondary_failure(
+                            capture, "returned", error, result=result, state_error=error
+                        )
+                    raise
+                if capture is not None:
+                    await self._emit_execution_receipt(
+                        capture.receipt("returned", result=result)
+                    )
                 return result
             finally:
-                _call_state.reset(token)
+                if capture_token is not None:
+                    active_execution.reset(capture_token)
+                if token is not None:
+                    _call_state.reset(token)
+                active_revision.reset(revision_token)
 
         # MCPServer must advertise the wrapped tool's parameters, not `*args, **kwargs`.
         wrapper.__signature__ = inspect.signature(fn)  # type: ignore[attr-defined]
@@ -305,6 +467,7 @@ class ServerBase(Generic[ConfigT, StateT]):
                     mcp = MCPServer(
                         self.server_name or type(self).__name__,
                         version=__version__,
+                        middleware=[_execution_metadata_middleware],
                     )
                     self.register(mcp)
                     # Modern HTTP is inherently sessionless. Keep the legacy leg stateless too so

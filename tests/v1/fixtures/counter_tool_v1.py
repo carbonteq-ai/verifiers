@@ -11,6 +11,7 @@ class CounterState(vf.State):
 
 class CounterToolset(vf.Toolset[vf.ToolsetConfig, CounterState]):
     TOOL_PREFIX = "counter"
+    CAPTURE_EXECUTIONS = True
 
     @vf.tool
     def bump(self) -> str:

@@ -35,6 +35,7 @@ from pydantic import (
     FieldSerializationInfo,
     field_serializer,
     field_validator,
+    model_validator,
 )
 from pydantic.json_schema import SkipJsonSchema
 from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens
@@ -42,12 +43,17 @@ from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens
 from verifiers.v1.semantic import ParentLink
 from verifiers.v1.types import (
     AssistantMessage,
+    GeneratedCallAttempt,
+    GeneratedCallProducer,
     Message,
     Response,
     SamplingMask,
     TextContentPart,
     Tool,
     ToolMessage,
+    generated_completion_digest,
+    validate_generated_call_links,
+    validate_generated_call_spans,
 )
 
 if TYPE_CHECKING:
@@ -101,6 +107,9 @@ class MessageNode(BaseModel):
     """True iff a model call produced this message (the response passed to `commit`); False for
     every prompt-supplied message — including assistant/tool messages fabricated as context
     the model never generated, which role alone can't tell apart from real turns."""
+    generated_calls: tuple[GeneratedCallAttempt, ...] = ()
+    generated_call_producer: GeneratedCallProducer | None = None
+    """Retained generated attempts in node-local full-token coordinates, not execution records."""
     timestamp: float = Field(default_factory=time.time)
     """Wall-clock epoch seconds when this node was created. Nodes materialize at turn commit,
     so a turn's new input nodes and its assistant node carry (near-)identical stamps and the
@@ -164,6 +173,21 @@ class MessageNode(BaseModel):
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def validate_parser_producer(self) -> MessageNode:
+        if self.generated_call_producer is not None:
+            producer = GeneratedCallProducer.model_validate(
+                self.generated_call_producer.model_dump(mode="json")
+            )
+            if any(
+                call.parser_revision != producer.parser_revision
+                for call in self.generated_calls
+            ):
+                raise ValueError(
+                    "generated-call attempts disagree with retained producer revision"
+                )
+        return self
 
     @field_serializer(
         "logprobs",
@@ -660,6 +684,50 @@ def _commit_turn(turn: PendingTurn, response: Response) -> int:
     trace = turn.trace
     prompt = turn.prompt
     tokens = response.tokens
+    # Validate transient parser metadata before any graph mutation. Serialized older
+    # responses have no attempts and retain their existing behavior.
+    generated_calls: tuple[GeneratedCallAttempt, ...] = ()
+    generated_call_producer = None
+    if tokens is not None and tokens.generated_call_producer is not None:
+        generated_call_producer = GeneratedCallProducer.model_validate(
+            tokens.generated_call_producer.model_dump(mode="json")
+        )
+        if any(
+            attempt.parser_revision != generated_call_producer.parser_revision
+            for attempt in tokens.generated_calls
+        ):
+            raise ValueError(
+                "generated-call attempts disagree with retained producer revision"
+            )
+    if tokens is not None and tokens.generated_calls:
+        generated_calls = tuple(
+            GeneratedCallAttempt.model_validate(attempt.model_dump(mode="json"))
+            for attempt in tokens.generated_calls
+        )
+        validate_generated_call_links(generated_calls, response.message.tool_calls)
+        validate_generated_call_spans(generated_calls)
+        if tuple(attempt.attempt_index for attempt in generated_calls) != tuple(
+            range(len(generated_calls))
+        ):
+            raise ValueError(
+                "generated attempts must have contiguous ordered occurrence indices"
+            )
+        completion_digest = generated_completion_digest(tokens.completion_ids)
+        for attempt in generated_calls:
+            if attempt.coordinate_system != "completion":
+                raise ValueError(
+                    "transient generated attempts require completion coordinates"
+                )
+            if attempt.completion_token_digest != completion_digest:
+                raise ValueError(
+                    "generated attempts do not match original completion tokens"
+                )
+            if attempt.token_span is not None and attempt.token_span[1] > len(
+                tokens.completion_ids
+            ):
+                raise ValueError(
+                    "generated-call span exceeds original completion tokens"
+                )
     multi_modal_data = tokens.multi_modal_data if tokens else None
     # Constant per renderer, so re-stamping every turn is idempotent.
     if tokens is not None and tokens.mm_token_type_id_map:
@@ -773,11 +841,30 @@ def _commit_turn(turn: PendingTurn, response: Response) -> int:
     comp_ids = tokens.completion_ids if tokens else []
     gen_start = path_len if cursor is None else cursor
     gen_prompt = prompt_ids[gen_start:]
+    node_generated_calls = tuple(
+        GeneratedCallAttempt.model_validate(
+            attempt.model_dump(mode="json")
+            | {
+                "coordinate_system": "node_local_full_tokens",
+                "token_span": (
+                    (
+                        attempt.token_span[0] + len(gen_prompt),
+                        attempt.token_span[1] + len(gen_prompt),
+                    )
+                    if attempt.token_span is not None
+                    else None
+                ),
+            }
+        )
+        for attempt in generated_calls
+    )
     trace.nodes.append(
         MessageNode.model_construct(
             parent=parent,
             message=response.message,
             sampled=True,
+            generated_calls=node_generated_calls,
+            generated_call_producer=generated_call_producer,
             token_ids=[*gen_prompt, *comp_ids],
             mask=[False] * len(gen_prompt) + [True] * len(comp_ids),
             is_content=([False] * len(gen_prompt) + [True] * len(comp_ids))

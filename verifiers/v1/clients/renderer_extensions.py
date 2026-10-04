@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import ast
+import json
+import re
 from typing import Any
 
 from renderers import RenderedTokens
@@ -106,6 +108,114 @@ class LFM2ToolParser:
         return [*token_ids[:start], *token_ids[end + 1 :]], calls
 
 
+class K2IFMToolParser:
+    """Parse K2-Horizon's IFM XML tool-call block from sampled tokens."""
+
+    _call = re.compile(r"<ifm\|tool_call>(.*?)</ifm\|tool_call>", flags=re.DOTALL)
+    _argument = re.compile(
+        r"\s*<ifm\|arg_key>(.*?)</ifm\|arg_key>\s*"
+        r"<ifm\|arg_value>(.*?)</ifm\|arg_value>",
+        flags=re.DOTALL,
+    )
+
+    def __init__(self, tokenizer: Any) -> None:
+        self._tokenizer = tokenizer
+        self._start = self._marker("<ifm|tool_calls>")
+        self._end = self._marker("</ifm|tool_calls>")
+
+    def _marker(self, text: str) -> list[int]:
+        return [int(token) for token in self._tokenizer.encode(text, add_special_tokens=False)]
+
+    @staticmethod
+    def _find(tokens: list[int], marker: list[int], start: int = 0) -> int | None:
+        if not marker:
+            return None
+        limit = len(tokens) - len(marker) + 1
+        return next((index for index in range(start, limit) if tokens[index : index + len(marker)] == marker), None)
+
+    def extract(self, token_ids: list[int]) -> tuple[list[int], list[ParsedToolCall]]:
+        start = self._find(token_ids, self._start)
+        if start is None:
+            return token_ids, []
+        body_start = start + len(self._start)
+        end = self._find(token_ids, self._end, body_start)
+        if end is None:
+            raw = self._tokenizer.decode(token_ids[body_start:], skip_special_tokens=False)
+            return token_ids[:start], [
+                ParsedToolCall(
+                    raw=raw,
+                    token_span=(start, len(token_ids)),
+                    status=ToolCallParseStatus.UNCLOSED_BLOCK,
+                )
+            ]
+        block_end = end + len(self._end)
+        raw_block = self._tokenizer.decode(token_ids[body_start:end], skip_special_tokens=False)
+        span = (start, block_end)
+        calls: list[ParsedToolCall] = []
+        matches = list(self._call.finditer(raw_block))
+        if not matches:
+            calls.append(
+                ParsedToolCall(raw=raw_block, token_span=span, status=ToolCallParseStatus.MALFORMED_STRUCTURE)
+            )
+        for match in matches:
+            raw = match.group(1).strip()
+            name, separator, remainder = raw.partition("\n")
+            name = name.strip()
+            if not separator or not name:
+                calls.append(
+                    ParsedToolCall(raw=raw, token_span=span, status=ToolCallParseStatus.MISSING_NAME)
+                )
+                continue
+            arguments: dict[str, Any] = {}
+            position = 0
+            valid = True
+            for argument in self._argument.finditer(remainder):
+                if remainder[position : argument.start()].strip():
+                    valid = False
+                    break
+                key = argument.group(1).strip()
+                value_text = argument.group(2).strip()
+                if not key or key in arguments:
+                    valid = False
+                    break
+                try:
+                    arguments[key] = json.loads(value_text)
+                except json.JSONDecodeError:
+                    arguments[key] = value_text
+                position = argument.end()
+            if remainder[position:].strip() or not valid:
+                calls.append(
+                    ParsedToolCall(
+                        raw=raw,
+                        name=name,
+                        token_span=span,
+                        status=ToolCallParseStatus.MALFORMED_STRUCTURE,
+                    )
+                )
+                continue
+            calls.append(ParsedToolCall(raw=raw, name=name, arguments=arguments, token_span=span))
+        return [*token_ids[:start], *token_ids[block_end:]], calls
+
+
+class K2IFMReasoningParser:
+    """Preserve K2's generated thinking field across tool-result turns."""
+
+    _close = re.compile(r"</ifm\|(think|think_fast|think_faster)>")
+    _open = re.compile(r"^\s*<ifm\|(think|think_fast|think_faster)>\s*")
+
+    def __init__(self, tokenizer: Any) -> None:
+        del tokenizer
+
+    def extract(self, text: str) -> tuple[str | None, str]:
+        close = self._close.search(text)
+        if close is None:
+            return None, text
+        before = text[: close.start()]
+        opened = self._open.match(before)
+        reasoning = before[opened.end() :] if opened is not None else before
+        return reasoning or None, text[close.end() :]
+
+
 def bridge_lfm2_tool_cycle(
     renderer: Any,
     previous_prompt_ids: list[int],
@@ -152,9 +262,17 @@ def bridge_lfm2_tool_cycle(
 def register_renderer_extensions() -> None:
     """Register CarbonTeq-supported protocol parsers idempotently."""
 
-    from renderers.parsers import TOOL_PARSERS
+    from renderers.parsers import REASONING_PARSERS, TOOL_PARSERS
 
     TOOL_PARSERS.setdefault("lfm2", LFM2ToolParser)
+    TOOL_PARSERS.setdefault("k2-ifm", K2IFMToolParser)
+    REASONING_PARSERS.setdefault("k2-ifm", K2IFMReasoningParser)
 
 
-__all__ = ["LFM2ToolParser", "bridge_lfm2_tool_cycle", "register_renderer_extensions"]
+__all__ = [
+    "K2IFMReasoningParser",
+    "K2IFMToolParser",
+    "LFM2ToolParser",
+    "bridge_lfm2_tool_cycle",
+    "register_renderer_extensions",
+]

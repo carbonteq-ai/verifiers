@@ -1,14 +1,24 @@
 from __future__ import annotations
 
 import copy
+import json
 import time
 import traceback
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
-from typing import TYPE_CHECKING, Any, Generic
+from typing import TYPE_CHECKING, Any, Generic, Literal
 
 import numpy as np
-from pydantic import BaseModel, Field, PrivateAttr, field_serializer
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    PrivateAttr,
+    field_serializer,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 from renderers.base import MultiModalData
 from typing_extensions import TypeVar
 
@@ -16,7 +26,9 @@ if TYPE_CHECKING:
     from verifiers.v1.judge import JudgeResponse
 
 from verifiers.v1 import graph
+from verifiers.v1.assessments import AssessmentBatch, SourceSnapshot, canonical_json
 from verifiers.v1.configs.agent import AgentConfig, WireAgentConfig
+from verifiers.v1.credit import CreditAssignment
 from verifiers.v1.errors import ProviderError
 from verifiers.v1.graph import RECORD_FLOAT_DECIMALS, MessageNode
 from verifiers.v1.runtimes import RuntimeInfo
@@ -34,6 +46,7 @@ from verifiers.v1.types import (
     ToolMessage,
     Usage,
     content_text,
+    generated_arguments_equal,
 )
 
 TRACE_VERSION = 1
@@ -115,6 +128,8 @@ class AgentInfo(BaseModel, Generic[AgentConfigT]):
     """The env agent that produced this trace (the config field name, e.g. `solver`)."""
     trainable: bool = True
     """Whether this trace's tokens train the run's policy."""
+    execution_purpose: Literal["solver", "assessment"] = "solver"
+    """Explicit execution role, independent of policy eligibility or agent name."""
 
 
 class TraceTask(BaseModel, Generic[DataT]):
@@ -134,6 +149,41 @@ class InterceptRecord(BaseModel):
     handler: str
 
 
+class ToolExecutionEvent(BaseModel):
+    """Harness-reported lifecycle and separate policy decision, never domain success."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    execution_id: str
+    event_index: int = Field(ge=0, strict=True)
+    phase: Literal["before", "after", "dispatch", "raised", "rejected", "interrupted"]
+    source: Literal["harness", "interceptor"] = "harness"
+    receipt_seq: int = Field(ge=0, strict=True)
+    node_index: int = Field(ge=0, strict=True)
+    emitted_call_index: int = Field(ge=0, strict=True)
+    generated_attempt_index: int | None = Field(default=None, ge=0, strict=True)
+    request_json: str
+    decision_json: str
+
+    @model_validator(mode="after")
+    def verify_payload(self):
+        from verifiers.v1.interception.tool import ToolHookRequest
+
+        payload = json.loads(self.request_json)
+        request = ToolHookRequest.model_validate(payload)
+        if (
+            canonical_json(payload) != self.request_json
+            or canonical_json(json.loads(self.decision_json)) != self.decision_json
+        ):
+            raise ValueError("tool execution payloads must be canonical JSON")
+        if (request.execution_id, request.event_index, request.phase) != (
+            self.execution_id,
+            self.event_index,
+            self.phase,
+        ):
+            raise ValueError("tool execution receipt identity disagrees with payload")
+        return self
+
+
 class Reward(BaseModel):
     score: float
     weight: float = 1.0
@@ -141,6 +191,87 @@ class Reward(BaseModel):
     @property
     def value(self) -> float:
         return self.score * self.weight
+
+
+class ToolServerExecutionEvent(BaseModel):
+    """Authenticated server observation without inferred sampled-action coordinates."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    source: Literal["tool_server"] = "tool_server"
+    invocation_id: str = Field(min_length=1)
+    event_index: int = Field(ge=0, le=1, strict=True)
+    phase: Literal["dispatch", "returned", "raised", "interrupted"]
+    receipt_seq: int = Field(ge=0, strict=True)
+    state_revision: int = Field(ge=0, strict=True)
+    receipt_json: str
+
+    @model_validator(mode="after")
+    def verify(self):
+        from verifiers.v1.mcp.execution import ToolServerReceipt
+
+        receipt = ToolServerReceipt.model_validate_json(self.receipt_json)
+        if canonical_json(receipt.model_dump(mode="json")) != self.receipt_json:
+            raise ValueError(
+                "tool-server receipt must retain canonical original payload"
+            )
+        if (self.invocation_id, self.event_index, self.phase) != (
+            receipt.invocation_id,
+            receipt.event_index,
+            receipt.phase,
+        ):
+            raise ValueError("tool-server event identity disagrees with receipt")
+        return self
+
+
+class StateWriteReceipt(BaseModel):
+    """Persisted acknowledgement for one invocation-bound state replacement."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+    write_id: str = Field(min_length=1)
+    body_digest: str = Field(pattern="^[a-f0-9]{64}$")
+    expected_revision: int | None = Field(default=None, ge=0, strict=True)
+    applied_revision: int = Field(ge=1, strict=True)
+    conflict: bool
+
+    @model_validator(mode="after")
+    def validate_conflict(self) -> StateWriteReceipt:
+        previous_revision = self.applied_revision - 1
+        if (
+            self.expected_revision is not None
+            and self.expected_revision > previous_revision
+        ):
+            raise ValueError(
+                "state write cannot acknowledge a future expected revision"
+            )
+        expected_conflict = (
+            self.expected_revision is not None
+            and self.expected_revision != previous_revision
+        )
+        if self.conflict != expected_conflict:
+            raise ValueError("state write conflict disagrees with revision history")
+        return self
+
+
+def validate_tool_server_state_ack(
+    receipt, writes: tuple[StateWriteReceipt, ...]
+) -> None:
+    """An applied claim must identify this invocation's own native acknowledgement."""
+    if receipt.state_persistence != "applied":
+        return
+    matches = [write for write in writes if write.write_id == receipt.invocation_id]
+    if len(matches) != 1:
+        raise ValueError(
+            "applied tool-server receipt requires its own native state-write acknowledgement"
+        )
+    write = matches[0]
+    if (
+        receipt.state_write_revision,
+        receipt.state_read_revision,
+        receipt.state_conflict,
+    ) != (write.applied_revision, write.expected_revision, write.conflict):
+        raise ValueError(
+            "tool-server applied claim disagrees with its native state-write acknowledgement"
+        )
 
 
 class PolicyEvent(BaseModel):
@@ -394,6 +525,8 @@ class Trace(BaseModel, Generic[DataT, StateT, AgentConfigT]):
     """The trace schema this trace serializes as."""
     id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     """Unique ID for this trace, auto-generated."""
+    episode_id: str | None = None
+    """Owning native episode, stamped before the trace's assessment lifecycle."""
     verifiers: VersionInfo = Field(default_factory=_current_build)
     """The verifiers version that produced this trace."""
     task: TraceTask[DataT]
@@ -406,6 +539,11 @@ class Trace(BaseModel, Generic[DataT, StateT, AgentConfigT]):
     nodes: list[MessageNode] = Field(default_factory=list)
     """The message graph, including physical and semantic parent links."""
     calls: list[ModelCall] = Field(default_factory=list)
+    tool_execution_events: tuple[
+        ToolExecutionEvent | ToolServerExecutionEvent, ...
+    ] = ()
+    tool_state_revision: int = Field(default=0, ge=0, strict=True)
+    state_write_receipts: tuple[StateWriteReceipt, ...] = ()
     """Every model call; automatically recorded at intercept time + linked into `nodes`."""
     mm_token_type_id_map: dict[int, int] = Field(default_factory=dict)
     """Special-token id -> modality marker (1 = image placeholder, 2 = video placeholder)
@@ -421,6 +559,18 @@ class Trace(BaseModel, Generic[DataT, StateT, AgentConfigT]):
     preceding error)."""
     metrics: dict[str, float | None] = Field(default_factory=dict)
     """Unweighted, named metrics; `None` as in `rewards`."""
+    assessment_batches: list[AssessmentBatch] = Field(default_factory=list)
+    """Retained assessment attempts, separate from scalar rewards and metrics."""
+    credit_assignments: list[CreditAssignment] = Field(default_factory=list)
+    """Native domain assignments; never implicitly added to scalar rewards."""
+    credit_errors: list[str] = Field(default_factory=list)
+    """Assignment planning errors, separate from solver execution errors."""
+    assessment_errors: list[str] = Field(default_factory=list)
+    """Assessment planning/availability codes, separate from execution failures."""
+    assessment_finalization_state: Literal["completed", "failed", "not_run"] | None = (
+        None
+    )
+    """Availability of finalized task evidence when an assessment source was captured."""
     info: dict[str, Any] = Field(default_factory=dict)
     """Scratch space for task-specific metadata."""
     root_reply: str | None = None
@@ -443,6 +593,201 @@ class Trace(BaseModel, Generic[DataT, StateT, AgentConfigT]):
 
     _head_index: dict = PrivateAttr(default_factory=dict)
     """`(parent, msg_hash) -> node_id` for the graph builder."""
+
+    @model_validator(mode="after")
+    def validate_tool_execution_events(self):
+        write_ids = set()
+        prior_write_revision = 0
+        for item in self.state_write_receipts:
+            write = StateWriteReceipt.model_validate(
+                item.model_dump(mode="python"), strict=True
+            )
+            if (
+                write.write_id in write_ids
+                or not prior_write_revision
+                < write.applied_revision
+                <= self.tool_state_revision
+            ):
+                raise ValueError("invalid retained state-write acknowledgement")
+            write_ids.add(write.write_id)
+            prior_write_revision = write.applied_revision
+        prior: dict[str, ToolExecutionEvent] = {}
+        server_prior: dict[str, ToolServerExecutionEvent] = {}
+        for index, item in enumerate(self.tool_execution_events):
+            if isinstance(item, ToolServerExecutionEvent):
+                event = ToolServerExecutionEvent.model_validate(
+                    item.model_dump(mode="python"), strict=True
+                )
+                receipt = json.loads(event.receipt_json)
+                from verifiers.v1._execution_links import validate_server_parent
+                from verifiers.v1.mcp.execution import ToolServerReceipt
+
+                validate_server_parent(
+                    ToolServerReceipt.model_validate(receipt),
+                    self.tool_execution_events[:index],
+                    self.nodes,
+                )
+
+                validate_tool_server_state_ack(
+                    ToolServerReceipt.model_validate(receipt), self.state_write_receipts
+                )
+                if event.state_revision > self.tool_state_revision or any(
+                    receipt[key] is not None and receipt[key] > event.state_revision
+                    for key in ("state_read_revision", "state_write_revision")
+                ):
+                    raise ValueError(
+                        "tool-server receipt reports a future state revision"
+                    )
+                previous_server = server_prior.get(event.invocation_id)
+                valid = (
+                    (event.event_index == 0 and event.phase == "dispatch")
+                    if previous_server is None
+                    else (
+                        previous_server.event_index == 0
+                        and event.event_index == 1
+                        and event.phase != "dispatch"
+                    )
+                )
+                if event.receipt_seq != index or not valid:
+                    raise ValueError("invalid retained tool-server lifecycle")
+                if previous_server is not None:
+                    before = json.loads(previous_server.receipt_json)
+                    after = json.loads(event.receipt_json)
+                    if any(
+                        before.get(key) != after.get(key)
+                        for key in (
+                            "tool_name",
+                            "arguments_json",
+                            "state_read_revision",
+                            "parent_execution_id",
+                            "dispatch_ticket",
+                            "transport_attempt_index",
+                            "server_name",
+                        )
+                    ):
+                        raise ValueError("tool-server invocation identity changed")
+                server_prior[event.invocation_id] = event
+                continue
+            event = ToolExecutionEvent.model_validate(
+                item.model_dump(mode="python"), strict=True
+            )
+            if event.receipt_seq != index or event.node_index >= len(self.nodes):
+                raise ValueError(
+                    "invalid tool execution receipt sequence or native node"
+                )
+            node = self.nodes[event.node_index]
+            if not isinstance(node.message, AssistantMessage):
+                raise ValueError(  # noqa: TRY004
+                    "tool execution target must be a native assistant call"
+                )
+            calls = node.message.tool_calls or []
+            if event.emitted_call_index >= len(calls):
+                raise ValueError("tool execution emitted ordinal is out of bounds")
+            emitted = calls[event.emitted_call_index]
+            payload = json.loads(event.request_json)["call"]
+            if (
+                payload["id"] != emitted.id
+                or payload["type"] != emitted.type
+                or payload["name"] != emitted.name
+                or not generated_arguments_equal(
+                    payload["arguments"], emitted.arguments
+                )
+            ):
+                raise ValueError(
+                    "tool execution receipt disagrees with its native emitted call"
+                )
+            if sum(call.id == emitted.id for call in calls) != 1:
+                raise ValueError("tool execution native provider ID is ambiguous")
+            if event.generated_attempt_index is not None:
+                if not node.sampled:
+                    raise ValueError(
+                        "unsampled tool owner cannot supply generated attribution"
+                    )
+                linked = [
+                    attempt.attempt_index
+                    for attempt in node.generated_calls
+                    if attempt.emitted_call_index == event.emitted_call_index
+                ]
+                if linked != [event.generated_attempt_index]:
+                    raise ValueError(
+                        "tool execution generated-attempt link is not unique"
+                    )
+            previous = prior.get(event.execution_id)
+            if previous is None:
+                valid = event.event_index == 0 and event.phase == "before"
+            else:
+                valid = (
+                    event.event_index == previous.event_index + 1
+                    and event.generated_attempt_index
+                    == previous.generated_attempt_index
+                    and (event.node_index, event.emitted_call_index)
+                    == (previous.node_index, previous.emitted_call_index)
+                    and (
+                        (
+                            previous.phase == "before"
+                            and event.phase in ("dispatch", "rejected")
+                        )
+                        or (
+                            previous.phase == "dispatch"
+                            and event.phase in ("after", "raised", "interrupted")
+                        )
+                    )
+                )
+                if (
+                    previous.phase == "before"
+                    and json.loads(previous.decision_json).get("action") != "allow"
+                ):
+                    valid = False
+            if not valid:
+                raise ValueError("invalid retained tool execution lifecycle")
+            prior[event.execution_id] = event
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def restore_assessment_archive(cls, value):
+        from verifiers.v1.assessment_archive import restore_history
+
+        return restore_history(value) if isinstance(value, dict) else value
+
+    @model_serializer(mode="wrap")
+    def serialize_assessment_archive(self, handler, info):
+        from verifiers.v1.assessment_archive import normalize_history
+
+        # Validate original receipt types before JSON serialization can normalize
+        # copied boolean/bytes coordinates into apparently valid wire fields.
+        for event in self.tool_execution_events:
+            type(event).model_validate(event.model_dump(mode="python"), strict=True)
+        for write in self.state_write_receipts:
+            StateWriteReceipt.model_validate(
+                write.model_dump(mode="python"), strict=True
+            )
+        data = handler(self)
+        return normalize_history(data) if info.mode == "json" else data
+
+    @field_validator("assessment_batches")
+    @classmethod
+    def retained_assessment_sources(
+        cls, batches: list[AssessmentBatch]
+    ) -> list[AssessmentBatch]:
+        for batch in batches:
+            if not isinstance(batch.source, SourceSnapshot):
+                raise ValueError(  # noqa: TRY004 - Pydantic schema validation
+                    "native assessment persistence requires the full retained source"
+                )
+        return batches
+
+    @field_validator("credit_assignments")
+    @classmethod
+    def retained_assignment_sources(
+        cls, assignments: list[CreditAssignment]
+    ) -> list[CreditAssignment]:
+        for assignment in assignments:
+            if not isinstance(assignment.request.source, SourceSnapshot):
+                raise ValueError(  # noqa: TRY004 - Pydantic schema validation
+                    "native assignment persistence requires the full retained source"
+                )
+        return assignments
 
     @field_serializer("mm_token_type_id_map")
     def serialize_mm_token_type_id_map(self, mapping: dict[int, int]) -> dict[str, int]:

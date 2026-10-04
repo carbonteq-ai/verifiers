@@ -3,10 +3,12 @@
 import argparse
 import asyncio
 import json
+import logging
 import subprocess
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import httpx
 from openai import APIStatusError, AsyncOpenAI
@@ -25,6 +27,7 @@ if TYPE_CHECKING:
     from verifiers.v1.harnesses.utils.mcp import call_mcp, connect_mcp  # noqa: TC004
 
 SERPER_URL = "https://google.serper.dev/search"
+_tool_logger = logging.getLogger(__name__)
 
 BASH_TOOL = {
     "type": "function",
@@ -201,14 +204,36 @@ async def run_tool_hook(
     api_key: str,
     phase: str,
     message: dict,
+    *,
+    execution_id: str | None = None,
+    event_index: int | None = None,
+    call: dict | None = None,
+    raw_result: str | None = None,
+    error: str | None = None,
+    mcp_dispatch: dict | None = None,
 ) -> dict:
+    payload = {"phase": phase, "message": message}
+    if execution_id is not None:
+        payload.update(execution_id=execution_id, event_index=event_index, call=call)
+    if raw_result is not None:
+        payload["raw_result"] = raw_result
+    if error is not None:
+        payload["error"] = error
+    if mcp_dispatch is not None:
+        payload["mcp_dispatch"] = mcp_dispatch
     response = await client.post(
         url,
         headers={"Authorization": f"Bearer {api_key}"},
-        json={"phase": phase, "message": message},
+        json=payload,
     )
     response.raise_for_status()
     decision = response.json()
+    if not isinstance(decision, dict) or decision.get("action") not in {
+        "allow",
+        "rewrite",
+        "stop",
+    }:
+        raise RuntimeError("tool hook returned an unsupported decision")
     if decision["action"] == "stop":
         raise RuntimeError(decision["reason"])
     return decision
@@ -242,6 +267,42 @@ async def run_chat_loop(
         tool_result_tokens = 0
         for call in message.tool_calls:
             name = call.function.name
+            execution_id = uuid4().hex
+            execution_call = {
+                "id": call.id,
+                "type": "function",
+                "name": name,
+                "arguments": call.function.arguments or "{}",
+            }
+
+            async def report(
+                phase,
+                event_index,
+                message,
+                *,
+                raw_result=None,
+                error=None,
+                mcp_dispatch=None,
+                execution_id=execution_id,
+                execution_call=execution_call,
+            ):
+                if not args.tool_interception_url:
+                    return {"action": "allow"}
+                assert tool_client is not None
+                return await run_tool_hook(
+                    tool_client,
+                    args.tool_interception_url,
+                    args.api_key,
+                    phase,
+                    message,
+                    execution_id=execution_id,
+                    event_index=event_index,
+                    call=execution_call,
+                    raw_result=raw_result,
+                    error=error,
+                    mcp_dispatch=mcp_dispatch,
+                )
+
             tool_message = {
                 "role": "tool",
                 "tool_call_id": call.id,
@@ -250,13 +311,7 @@ async def run_chat_loop(
             }
             if args.tool_interception_url:
                 assert tool_client is not None
-                decision = await run_tool_hook(
-                    tool_client,
-                    args.tool_interception_url,
-                    args.api_key,
-                    "before",
-                    tool_message,
-                )
+                decision = await report("before", 0, tool_message)
                 if decision["action"] == "rewrite":
                     rewritten = bound_tool_message(decision["message"])
                     messages.append(rewritten)
@@ -264,46 +319,84 @@ async def run_chat_loop(
                         str(rewritten.get("content", ""))
                     )
                     continue
+            rejected = False
             try:
                 tool_args = json.loads(call.function.arguments or "{}")
             except json.JSONDecodeError as e:
                 content = f"error: invalid JSON in tool arguments ({e}); resend the call with valid JSON"
+                rejected = True
             else:
                 # Valid JSON can still be a non-object (`[]`, `42`, `null`).
                 if not isinstance(tool_args, dict):
                     content = f"error: tool arguments must be a JSON object, got {type(tool_args).__name__}; resend as an object"
-                elif name in dispatch:
-                    content = await call_mcp(servers, dispatch, name, tool_args)
-                elif name == "bash" and args.bash:
-                    content = await asyncio.to_thread(
-                        run_bash, tool_args.get("command", "")
-                    )
-                elif name == "edit" and args.edit:
-                    content = await asyncio.to_thread(
-                        run_edit,
-                        tool_args.get("path"),
-                        tool_args.get("old_str"),
-                        tool_args.get("new_str"),
-                    )
-                elif name == "search" and args.search:
-                    content = await asyncio.to_thread(
-                        run_search,
-                        tool_args.get("query", ""),
-                        args.serper_key,
-                        tool_args.get("num_results", 5),
-                    )
-                else:
+                    rejected = True
+                elif not (
+                    name in dispatch
+                    or (name == "bash" and args.bash)
+                    or (name == "edit" and args.edit)
+                    or (name == "search" and args.search)
+                ):
                     content = f"error: unknown tool {name!r}"
+                    rejected = True
+                else:
+                    route = None
+                    if name in dispatch:
+                        server_name, raw_tool = dispatch[name]
+                        route = {"server_name": server_name, "tool_name": raw_tool,
+                                 "arguments_json": json.dumps(tool_args, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)}
+                    dispatch_decision = await report("dispatch", 1, tool_message, mcp_dispatch=route)
+                    try:
+                        if name in dispatch:
+                            ticket = dispatch_decision.get("mcp_dispatch_ticket")
+                            parent = {"parent_execution_id": execution_id, "dispatch_ticket": ticket} if type(ticket) is str and ticket else {}
+                            content = await call_mcp(servers, dispatch, name, tool_args, **parent)
+                        elif name == "bash":
+                            content = await asyncio.to_thread(
+                                run_bash, tool_args.get("command", "")
+                            )
+                        elif name == "edit":
+                            content = await asyncio.to_thread(
+                                run_edit,
+                                tool_args.get("path"),
+                                tool_args.get("old_str"),
+                                tool_args.get("new_str"),
+                            )
+                        else:
+                            content = await asyncio.to_thread(
+                                run_search,
+                                tool_args.get("query", ""),
+                                args.serper_key,
+                                tool_args.get("num_results", 5),
+                            )
+                    except BaseException as error:
+                        phase = (
+                            "interrupted"
+                            if isinstance(error, asyncio.CancelledError)
+                            else "raised"
+                        )
+                        try:
+                            await report(
+                                phase,
+                                2,
+                                tool_message,
+                                error=f"{type(error).__name__}: {error}",
+                            )
+                        except (Exception, asyncio.CancelledError) as reporting_error:  # noqa: BLE001
+                            # Reporting cannot replace the original execution failure.
+                            _tool_logger.warning(
+                                "Could not record tool failure (%s)",
+                                type(reporting_error).__name__,
+                            )
+                        raise
             tool_message["content"] = content
             tool_message = bound_tool_message(tool_message)
             if args.tool_interception_url:
                 assert tool_client is not None
-                decision = await run_tool_hook(
-                    tool_client,
-                    args.tool_interception_url,
-                    args.api_key,
-                    "after",
+                decision = await report(
+                    "rejected" if rejected else "after",
+                    1 if rejected else 2,
                     tool_message,
+                    raw_result=content,
                 )
                 if decision["action"] == "rewrite":
                     tool_message = bound_tool_message(decision["message"])

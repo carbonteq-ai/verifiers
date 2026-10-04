@@ -9,6 +9,7 @@ initializes a task instance. Rides on `trace.task.data` in `traces.jsonl`.
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import inspect
@@ -20,7 +21,14 @@ from typing import TYPE_CHECKING, Any, ClassVar, Generic, Self
 from pydantic import BaseModel, ConfigDict, Field
 from typing_extensions import TypeVar
 
+from verifiers.v1._validation_scope import validation_owner
+from verifiers.v1.assessments import (
+    AssessmentBatch,
+    AssessmentRequest,
+    SourceSnapshot,
+)
 from verifiers.v1.configs.task import TaskConfig
+from verifiers.v1.credit import CreditPlanningContext, CreditRequest
 from verifiers.v1.errors import TaskError, boundary
 from verifiers.v1.state import StateT
 from verifiers.v1.types import Messages, content_text
@@ -200,6 +208,144 @@ class Task(Generic[DataT, StateT, ConfigT]):
         trace: Trace,
         runtime: Runtime | None = None,
     ) -> None:
+        """Score legacy signals and retain independent native assessment attempts."""
+        if self.scoring_deferred:
+            return
+        cancelled = False
+        try:
+            await self._score_scalar(trace, runtime)
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            # Independent evidence remains useful even when a legacy scorer fails.
+            # Assessment infrastructure errors are retained without hiding that error.
+            try:
+                if not cancelled:
+                    await self.score_assessments(trace)
+            except Exception as exc:  # noqa: BLE001 - retain planning failure independently
+                trace.assessment_errors.append(
+                    f"assessment_planning_failed:{type(exc).__name__}"
+                )
+                logger.warning(
+                    "assessment planning failed for %s: %s",
+                    type(self).__name__,
+                    type(exc).__name__,
+                )
+
+    def assessment_source(self, trace: Trace) -> Any:
+        """Select available task evidence for immutable retention before assessment.
+
+        Return JSON-compatible verifier data or retained artifact references. Nothing
+        from arbitrary info/state is included unless the task explicitly selects it.
+        Failed-prefix assessment has finalization_state=not_run; do not assume that
+        finalize ran or that runtime-only outcomes are available in that case.
+        """
+        return None
+
+    def assessment_requests(
+        self, source: SourceSnapshot
+    ) -> list[tuple[str, AssessmentRequest]]:
+        """Trusted planning: declare each hook's targets, signal definitions and input.
+
+        A hook may have several invocations with separately restricted views. The
+        assessor receives only its request identity and declared input, never source.
+        Invocations in this plan are independent and read-only; a producer owns
+        ordered steps for conditional or derived evidence inside its invocation.
+        """
+        if self.hooks("assessment"):
+            raise NotImplementedError(
+                "assessment hooks require explicit assessment_requests"
+            )
+        return []
+
+    @validation_owner()
+    async def score_assessments(self, trace: Trace) -> None:
+        if self.scoring_deferred:
+            return
+        hooks = {fn.__name__: fn for fn in self.hooks("assessment")}
+        credit_hooks = {fn.__name__: fn for fn in self.hooks("credit")}
+        if not hooks and not credit_hooks:
+            return
+        from verifiers.v1.assessment_runtime import execute_assessment_plan
+        from verifiers.v1.assessment_source import capture_trace_source
+
+        source = capture_trace_source(
+            trace, task_evidence=self.assessment_source(trace)
+        )
+        requests = self.assessment_requests(source)
+        context = CreditPlanningContext.model_validate(
+            {
+                "source": source.identity.model_dump(mode="json"),
+                "current_assessment_runs": [
+                    request.run.model_dump(mode="json") for _, request in requests
+                ],
+                "prior_assignments": [
+                    assignment.model_dump(mode="json")
+                    for assignment in trace.credit_assignments
+                ],
+            }
+        )
+        await execute_assessment_plan(
+            hooks,
+            requests,
+            source,
+            trace.assessment_batches,
+            self.config.max_concurrent_assessments,
+        )
+        if credit_hooks:
+            from verifiers.v1.credit import execute_credit_plan
+
+            try:
+                await execute_credit_plan(
+                    credit_hooks,
+                    self.plan_credit(source, tuple(trace.assessment_batches), context),
+                    source,
+                    trace.credit_assignments,
+                    accepted=tuple(
+                        record
+                        for batch in trace.assessment_batches
+                        for record in batch.assessments
+                    ),
+                )
+            except Exception as error:  # noqa: BLE001 - preserve independent assignment diagnostics.
+                trace.credit_errors.append(
+                    f"credit_planning_failed:{type(error).__name__}"
+                )
+
+    def plan_credit(
+        self,
+        source: SourceSnapshot,
+        assessments: tuple[AssessmentBatch, ...],
+        context: CreditPlanningContext,
+    ) -> list[tuple[str, CreditRequest]]:
+        """Plan assignments with the explicit current call and prior history.
+
+        Override to select current attempts or protect consumed evidence. The
+        default delegates to ``credit_requests`` for existing task classes; it
+        introduces no evidence selection, implicit retry or deduplication.
+        """
+        if context.source != source.identity:
+            raise ValueError("credit planning context/source mismatch")
+        return self.credit_requests(source, assessments)
+
+    def credit_requests(
+        self, source: SourceSnapshot, assessments: tuple[AssessmentBatch, ...]
+    ) -> list[tuple[str, CreditRequest]]:
+        """Select accepted findings and explicit recipients for each assignment rule.
+
+        Journal snapshots and retries remain distinct. The planner selects evidence
+        explicitly; the runtime never picks a maximum score or sums every finding.
+        """
+        if self.hooks("credit"):
+            raise NotImplementedError("credit hooks require explicit credit_requests")
+        return []
+
+    async def _score_scalar(
+        self,
+        trace: Trace,
+        runtime: Runtime | None = None,
+    ) -> None:
         if self.scoring_deferred:
             return
 
@@ -291,6 +437,8 @@ class Task(Generic[DataT, StateT, ConfigT]):
             "stop": self.config.stops,
             "metric": self.config.metrics,
             "reward": self.config.rewards,
+            "assessment": self.config.assessments,
+            "credit": self.config.credit_rules,
         }[attr]
         merged = {fn.__name__: fn for fn in discover_decorated(self, attr)}
         merged |= {

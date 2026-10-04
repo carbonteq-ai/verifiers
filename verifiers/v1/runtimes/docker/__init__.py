@@ -33,6 +33,10 @@ logger = logging.getLogger(__name__)
 class DockerConfig(NetworkPolicyConfig):
     type: Literal["docker"] = "docker"
     image: str = "python:3.11-slim"
+    listener_image: str = "python:3.11-alpine"
+    """Image providing Python for the container-network proxy listener helper."""
+    network_setup_image: str = "alpine:3.22"
+    """Image providing network setup tools for the execution-time egress helper."""
     workdir: str = "/app"
     # TaskData.resources uses these units; non-default runtime config values take precedence.
     cpu: float | None = None
@@ -307,7 +311,7 @@ class DockerRuntime(Runtime):
                     "no-new-privileges",
                     "--mount",
                     f"type=bind,source={directory},target=/run/vf",
-                    "python:3.11-alpine",
+                    self.config.listener_image,
                     "python3",
                     "-c",
                     _PASS_LISTENER,
@@ -386,7 +390,7 @@ class DockerRuntime(Runtime):
             "ALL",
             "--cap-add",
             "NET_ADMIN",
-            "alpine:3.22",
+            self.config.network_setup_image,
             "sh",
             "-c",
             script,

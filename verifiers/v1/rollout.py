@@ -129,6 +129,8 @@ class Rollout:
         )
         self._stack = AsyncExitStack()
         self._failed = False
+        self._setup_completed = False
+        self._assessment_deadline_expired = False
         self._failure: Exception | None = None
         self._opened = False
         self._closed = False
@@ -172,6 +174,13 @@ class Rollout:
         if not isinstance(error, RolloutError):
             logger.exception("unexpected error in rollout %s", self.trace.id)
         self._failed = True
+        cause: BaseException | None = error
+        seen: set[int] = set()
+        while cause is not None and id(cause) not in seen:
+            seen.add(id(cause))
+            if isinstance(cause, TimeoutError):
+                self._assessment_deadline_expired = True
+            cause = cause.__cause__
         self._failure = error
         self.trace.record_error(error)
 
@@ -316,10 +325,6 @@ class Rollout:
                     session_kwargs = (
                         {"tool_interception_url": f"{runtime.host_url(base_url)}/tool"}
                         if self.harness.SUPPORTS_TOOL_INTERCEPTION
-                        and (
-                            self._session.request_interceptors
-                            or self._session.request_stops
-                        )
                         else {}
                     )
                     self._harness_session = await self.harness.session(
@@ -342,6 +347,7 @@ class Rollout:
             await self.abort()
             raise
         now = time.time()
+        self._setup_completed = True
         self.trace.timing.setup.end = now
         self.trace.timing.agent.start = now
         return not self._session.stopped
@@ -381,6 +387,7 @@ class Rollout:
                         return False
                 await self._harness_session.turn(messages)
         except TimeoutError as e:
+            self._assessment_deadline_expired = True
             # An expired rollout deadline is the agent breaking its time budget —
             # an agent failure, never a clean stop. A TimeoutError from the
             # harness's own I/O with no expired deadline stays the raw failure.
@@ -441,8 +448,10 @@ class Rollout:
 
     async def close(self) -> Trace:
         """Finish the rollout: tool servers and interception down, task `finalize`
-        and per-rollout scoring (skipped when the run already failed — but a stopped
-        run is complete and scores its partial trajectory), then runtime teardown.
+        and scalar scoring (skipped when the run already failed), then runtime
+        teardown. Eligible failed prefixes can receive independent assessments;
+        expired execution deadlines never launch them. A stopped run still scores
+        its partial trajectory normally.
         Idempotent; always returns the trace."""
         if self._closed:
             return self.trace
@@ -469,6 +478,7 @@ class Rollout:
             if not self._failed and self._opened:
                 assert runtime is not None
                 trace.timing.finalize.start = time.time()
+                trace.assessment_finalization_state = "failed"
                 async with boundary(TaskError, "task finalize"):
                     async with asyncio.timeout(self._timeouts.finalize):
                         await invoke(
@@ -479,6 +489,7 @@ class Rollout:
                                 runtime, self.task.data.artifacts
                             )
                 now = time.time()
+                trace.assessment_finalization_state = "completed"
                 trace.timing.finalize.end = now
                 trace.timing.scoring.start = now
                 async with boundary(TaskError, "scoring"):
@@ -491,6 +502,35 @@ class Rollout:
                         self._timeouts.scoring,
                     )
                 trace.timing.scoring.end = time.time()
+            elif self._failed:
+                trace.assessment_finalization_state = "not_run"
+                if self.task.hooks("assessment") and not self.task.scoring_deferred:
+                    if self._assessment_deadline_expired:
+                        trace.assessment_errors.append(
+                            "assessment_not_dispatched:execution_timeout"
+                        )
+                    elif not self._setup_completed:
+                        trace.assessment_errors.append(
+                            "assessment_not_dispatched:setup_unavailable"
+                        )
+                    elif not any(node.sampled for node in trace.nodes):
+                        trace.assessment_errors.append(
+                            "assessment_not_dispatched:no_sampled_prefix"
+                        )
+                    else:
+                        try:
+                            await asyncio.wait_for(
+                                self.task.score_assessments(trace),
+                                self._timeouts.scoring,
+                            )
+                        except TimeoutError:
+                            trace.assessment_errors.append(
+                                "assessment_failed_prefix_timeout"
+                            )
+                        except Exception as error:  # noqa: BLE001 - preserve execution error
+                            trace.assessment_errors.append(
+                                f"assessment_failed_prefix_error:{type(error).__name__}"
+                            )
         except Exception as e:  # noqa: BLE001 - finalize boundary records every rollout failure
             self.fail(e)
         finally:

@@ -8,11 +8,14 @@ from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import (
+    Any,
     Generic,
     TypeVar,
 )
 
+from verifiers.v1._validation_scope import validation_owner
 from verifiers.v1.agent import Agent, Agents, _EpisodeAgent
+from verifiers.v1.assessments import AssessmentBatch, AssessmentRequest, SourceSnapshot
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.clients.client import ClientFactory
 from verifiers.v1.configs.agent import AgentConfig
@@ -21,6 +24,7 @@ from verifiers.v1.configs.env import (
     _declared_agent_configs,
     default_agent_harness,
 )
+from verifiers.v1.credit import CreditPlanningContext, CreditRequest
 from verifiers.v1.episode import EnvInfo, Episode
 from verifiers.v1.errors import EnvError, boundary
 from verifiers.v1.harness import Harness, HarnessConfig
@@ -33,6 +37,7 @@ from verifiers.v1.mcp import SharedToolServer, serve_shared
 from verifiers.v1.runtimes import SubprocessConfig, runtime_is_local
 from verifiers.v1.task import Task
 from verifiers.v1.trace import Error, Trace, TraceTask
+from verifiers.v1.utils.decorators import discover_decorated
 from verifiers.v1.utils.generic import concrete_type, deep_merge
 from verifiers.v1.utils.memory import trim_memory_periodically
 from verifiers.v1.utils.retries import run_episode_with_retry
@@ -172,6 +177,118 @@ class Env(ABC, Generic[ConfigT]):
         fails the episode (the retryable unit) — validate strictly, never
         record a guess."""
 
+    def assessment_source(self, task: Task, episode: Episode) -> Any:
+        """Explicitly select JSON-compatible episode verifier input for retention."""
+        return None
+
+    def assessment_requests(
+        self, source: SourceSnapshot
+    ) -> list[tuple[str, AssessmentRequest]]:
+        """Trusted planning of episode assessors and their restricted views.
+
+        Independent invocations may execute concurrently. Ordered or conditional
+        evidence belongs inside an invocation, with declared parent evidence.
+        """
+        if discover_decorated(self, "assessment"):
+            raise NotImplementedError(
+                "assessment hooks require explicit assessment_requests"
+            )
+        return []
+
+    @validation_owner()
+    async def score_assessments(
+        self, task: Task, episode: Episode, *, finalization_state: str
+    ) -> None:
+        """Assess the episode without changing its scalar scores or execution verdict.
+
+        Source/planning failures are distinct infrastructure diagnostics. Producer
+        failures are retained by the common executor as failed assessment attempts.
+        Cancellation escapes so callers do not dispatch work after their deadline.
+        """
+        hooks = {hook.__name__: hook for hook in discover_decorated(self, "assessment")}
+        credit_hooks = {
+            hook.__name__: hook for hook in discover_decorated(self, "credit")
+        }
+        if not hooks and not credit_hooks:
+            return
+        from verifiers.v1.assessment_runtime import execute_assessment_plan
+        from verifiers.v1.episode_assessment import capture_episode_source
+
+        try:
+            source = capture_episode_source(
+                episode,
+                task_evidence=self.assessment_source(task, episode),
+                finalization_state=finalization_state,
+            )
+            requests = self.assessment_requests(source)
+            context = CreditPlanningContext.model_validate(
+                {
+                    "source": source.identity.model_dump(mode="json"),
+                    "current_assessment_runs": [
+                        request.run.model_dump(mode="json") for _, request in requests
+                    ],
+                    "prior_assignments": [
+                        assignment.model_dump(mode="json")
+                        for assignment in episode.credit_assignments
+                    ],
+                }
+            )
+            await execute_assessment_plan(
+                hooks=hooks,
+                requests=requests,
+                source=source,
+                retained=episode.assessment_batches,
+                max_concurrent=task.config.max_concurrent_assessments,
+            )
+            if credit_hooks:
+                from verifiers.v1.credit import execute_credit_plan
+
+                try:
+                    await execute_credit_plan(
+                        credit_hooks,
+                        self.plan_credit(
+                            source, tuple(episode.assessment_batches), context
+                        ),
+                        source,
+                        episode.credit_assignments,
+                        accepted=tuple(
+                            record
+                            for batch in episode.assessment_batches
+                            for record in batch.assessments
+                        ),
+                    )
+                except Exception as error:  # noqa: BLE001 - retain independent assignment planning.
+                    episode.credit_errors.append(
+                        f"credit_planning_failed:{type(error).__name__}"
+                    )
+        except Exception as error:  # noqa: BLE001 - optional evidence infrastructure.
+            episode.assessment_errors.append(
+                f"assessment_infrastructure_error:{type(error).__name__}"
+            )
+
+    def plan_credit(
+        self,
+        source: SourceSnapshot,
+        assessments: tuple[AssessmentBatch, ...],
+        context: CreditPlanningContext,
+    ) -> list[tuple[str, CreditRequest]]:
+        """Plan episode credit with explicit current attempts and prior assignments.
+
+        Default delegation preserves existing ``credit_requests`` policies. An
+        environment owns evidence selection and reuse; the runtime retains history.
+        """
+        if context.source != source.identity:
+            raise ValueError("credit planning context/source mismatch")
+        return self.credit_requests(source, assessments)
+
+    def credit_requests(
+        self, source: SourceSnapshot, assessments: tuple[AssessmentBatch, ...]
+    ) -> list[tuple[str, CreditRequest]]:
+        """Explicitly select episode findings and recipients, without scalar reduction."""
+        if discover_decorated(self, "credit"):
+            raise NotImplementedError("credit hooks require explicit credit_requests")
+        return []
+
     def complete(self, episode: Episode) -> bool:
         """Whether a finished episode is a valid result — what `--resume` keeps
         vs. redoes (default `episode.ok`). An env whose `run()` tolerates a
@@ -267,7 +384,15 @@ class Env(ABC, Generic[ConfigT]):
                 hash=task.hash,
             ),
         )
-        agents = self._episode_agents(ctx, episode.traces, on_trace, on_discard)
+
+        def observe_trace(trace: Trace) -> None:
+            if trace.episode_id is not None and trace.episode_id != episode.id:
+                raise ValueError("trace belongs to a different episode")
+            trace.episode_id = episode.id
+            if on_trace is not None:
+                on_trace(trace)
+
+        agents = self._episode_agents(ctx, episode.traces, observe_trace, on_discard)
         try:
             async with asyncio.timeout(self.config.timeout.episode):
                 async with boundary(EnvError, f"{type(self).__name__}.setup()"):
@@ -288,12 +413,36 @@ class Env(ABC, Generic[ConfigT]):
                 )
             episode.errors.append(_as_error(e))
             # The completed subset is the crash-safe episode; ok stays False.
+            episode.assessment_finalization_state = "not_run"
+            if not isinstance(e, TimeoutError):
+                try:
+                    async with asyncio.timeout(self.config.timeout.finalize):
+                        await self.score_assessments(
+                            task, episode, finalization_state="not_run"
+                        )
+                except TimeoutError:
+                    episode.assessment_errors.append("assessment_deadline_exceeded")
+            else:
+                episode.assessment_errors.append("assessment_skipped:execution_timeout")
             return episode
         try:
             async with asyncio.timeout(self.config.timeout.finalize):
                 async with boundary(EnvError, f"{type(self).__name__}.finalize()"):
                     await self.finalize(task, episode)
+                # Stamp execution's verdict before capturing assessor source inputs.
+                episode.ok = all(t.ok for t in episode.traces)
+                episode.assessment_finalization_state = "completed"
+                await self.score_assessments(
+                    task, episode, finalization_state="completed"
+                )
         except Exception as e:  # noqa: BLE001 - episode boundary records every hook failure
+            if episode.assessment_finalization_state == "completed":
+                episode.assessment_errors.append(
+                    "assessment_deadline_exceeded"
+                    if isinstance(e, TimeoutError)
+                    else f"assessment_infrastructure_error:{type(e).__name__}"
+                )
+                return episode
             # As above: a TimeoutError here is the deadline's own expiry.
             if isinstance(e, TimeoutError):
                 e = TimeoutError(
@@ -301,6 +450,9 @@ class Env(ABC, Generic[ConfigT]):
                     f"{self.config.timeout.finalize:g}s deadline (--env.timeout.finalize)"
                 )
             episode.errors.append(_as_error(e))
+            episode.ok = False
+            episode.assessment_finalization_state = "failed"
+            episode.assessment_errors.append("assessment_skipped:finalization_failed")
             return episode
         # Both hooks and every trace concluded — stamp the attempt's verdict
         # (retry history merges into `errors` later without touching it).

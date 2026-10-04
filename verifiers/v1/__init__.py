@@ -4,6 +4,42 @@ from pydantic_config import BaseConfig
 
 from verifiers.v1.acp import ACPConfig, ACPHarness, ACPTurn
 from verifiers.v1.agent import Agent, Agents, Interaction, Segment, make_agent
+from verifiers.v1.assessment_projection import (
+    ContributionProjection,
+    CreditAlignment,
+    ProjectionInterval,
+    ProjectionResult,
+    project_assignment,
+    project_subject,
+    token_representation_digest,
+)
+from verifiers.v1.assessment_source import (
+    capture_execution_view,
+    execution_refs,
+    resolve_execution,
+    resolve_execution_parent,
+)
+from verifiers.v1.assessments import (
+    ArtifactRef,
+    Assessment,
+    AssessmentBatch,
+    AssessmentContext,
+    AssessmentRequest,
+    AssessmentRun,
+    AssessmentTarget,
+    Assessor,
+    Derivation,
+    ExecutionEvidence,
+    ExecutionRef,
+    NodeRef,
+    ObservationView,
+    PreferenceResult,
+    SignalDefinition,
+    SourceIdentity,
+    SourceSnapshot,
+    SubjectRef,
+)
+from verifiers.v1.chat_assessor import ChatAssessor
 from verifiers.v1.clients import (
     BaseClientConfig,
     Client,
@@ -31,6 +67,17 @@ from verifiers.v1.configs.task import (
     TaskConfig,
 )
 from verifiers.v1.configs.taskset import TasksetConfig
+from verifiers.v1.credit import (
+    AssignmentRule,
+    CreditAssignment,
+    CreditContribution,
+    CreditGate,
+    CreditPlanningContext,
+    CreditRequest,
+    CreditRule,
+    CreditTarget,
+    execute_credit_assignment,
+)
 from verifiers.v1.env import Env
 from verifiers.v1.envs.single_agent import SingleAgentEnv, SingleAgentEnvConfig
 from verifiers.v1.episode import (
@@ -72,6 +119,7 @@ from verifiers.v1.mcp import (
     Toolset,
     ToolsetConfig,
 )
+from verifiers.v1.mcp.execution import ToolServerReceipt, record_execution_evidence
 from verifiers.v1.runtimes import (
     DockerConfig,
     PrimeConfig,
@@ -102,9 +150,12 @@ from verifiers.v1.trace import (
     ModelCall,
     PolicyEvent,
     Reward,
+    StateWriteReceipt,
     TimeSpan,
     TimeSplit,
     Timing,
+    ToolExecutionEvent,
+    ToolServerExecutionEvent,
     Trace,
     TraceTask,
     VersionInfo,
@@ -114,6 +165,8 @@ from verifiers.v1.types import (
     ID,
     AssistantMessage,
     ContentPart,
+    GeneratedCallAttempt,
+    GeneratedCallProducer,
     ImageUrlContentPart,
     ImageUrlSource,
     Message,
@@ -140,6 +193,8 @@ from verifiers.v1.utils.artifacts import (
     restore,
 )
 from verifiers.v1.utils.decorators import (
+    assessment,
+    credit,
     intercept,
     metric,
     reward,
@@ -193,6 +248,15 @@ from verifiers.v1.utils.score import (
 )
 
 __all__ = [  # noqa: RUF022 - grouped by public API area
+    "AssignmentRule",
+    "CreditAssignment",
+    "CreditContribution",
+    "CreditGate",
+    "CreditPlanningContext",
+    "CreditRequest",
+    "CreditRule",
+    "CreditTarget",
+    "execute_credit_assignment",
     # types
     "ID",
     "AssistantMessage",
@@ -210,6 +274,8 @@ __all__ = [  # noqa: RUF022 - grouped by public API area
     "TextContentPart",
     "Tool",
     "ToolCall",
+    "GeneratedCallAttempt",
+    "GeneratedCallProducer",
     "ToolMessage",
     "Usage",
     "UserMessage",
@@ -222,6 +288,11 @@ __all__ = [  # noqa: RUF022 - grouped by public API area
     "Trace",
     "TraceTask",
     "WireTrace",
+    "ToolExecutionEvent",
+    "ToolServerExecutionEvent",
+    "StateWriteReceipt",
+    "ToolServerReceipt",
+    "record_execution_evidence",
     "Reward",
     "EnvInfo",
     "Episode",
@@ -261,6 +332,39 @@ __all__ = [  # noqa: RUF022 - grouped by public API area
     "tool",
     "metric",
     "reward",
+    "assessment",
+    "credit",
+    # native assessment evidence
+    "ArtifactRef",
+    "Assessment",
+    "AssessmentBatch",
+    "AssessmentContext",
+    "AssessmentRequest",
+    "AssessmentRun",
+    "AssessmentTarget",
+    "Assessor",
+    "Derivation",
+    "ExecutionEvidence",
+    "ChatAssessor",
+    "NodeRef",
+    "ObservationView",
+    "PreferenceResult",
+    "SignalDefinition",
+    "SourceIdentity",
+    "ExecutionRef",
+    "capture_execution_view",
+    "execution_refs",
+    "resolve_execution",
+    "resolve_execution_parent",
+    "SourceSnapshot",
+    "SubjectRef",
+    "ProjectionInterval",
+    "ContributionProjection",
+    "CreditAlignment",
+    "project_assignment",
+    "ProjectionResult",
+    "project_subject",
+    "token_representation_digest",
     # interception
     "InterceptRecord",
     # errors

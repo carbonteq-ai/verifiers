@@ -7,10 +7,238 @@ are local-only (their marks are excluded in CI)."""
 
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 mark = pytest.mark
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        None,
+        "raised",
+        "interrupted",
+        "hook_error",
+        "hook_incomplete",
+        "native_http",
+        "native_http_rewrite",
+        "native_http_stop",
+    ],
+)
+async def test_bundled_chat_reports_execution_occurrences_before_bounding(
+    monkeypatch, failure
+):
+    import asyncio
+    import json
+    from contextlib import AsyncExitStack
+
+    import httpx
+
+    from verifiers.v1.harnesses.utils import compaction, core
+    from verifiers.v1.interception.tool import ToolHookRequest
+
+    native_disposition = failure
+    native_http = failure in ("native_http", "native_http_rewrite", "native_http_stop")
+    if native_http:
+        failure = None
+
+    for name in (
+        "bound_tool_message",
+        "estimated_tokens",
+        "compactable",
+        "CompactionFailed",
+        "is_context_overflow",
+    ):
+        monkeypatch.setattr(core, name, getattr(compaction, name), raising=False)
+    payloads, executed = [], []
+    original = "result" * 10_000
+
+    async def tool(servers, dispatch, name, arguments, **provenance):
+        executed.append((name, arguments))
+        if failure == "raised":
+            raise RuntimeError("fixture execution failure")
+        if failure == "interrupted":
+            raise asyncio.CancelledError
+        return original
+
+    monkeypatch.setattr(core, "call_mcp", tool, raising=False)
+
+    async def receive(request):
+        body = json.loads(request.content)
+        ToolHookRequest.model_validate(body)
+        payloads.append(body)
+        if failure == "hook_error" and body["phase"] == "before":
+            return httpx.Response(200, json={"action": "error"})
+        if failure == "hook_incomplete" and body["phase"] == "after":
+            return httpx.Response(200, json={"action": "incomplete"})
+        return httpx.Response(200, json={"action": "allow"})
+
+    calls = [
+        SimpleNamespace(
+            id=str(i), function=SimpleNamespace(name=name, arguments=arguments)
+        )
+        for i, (name, arguments) in enumerate(
+            (("lookup", "{}"), ("lookup", "broken"), ("missing", "{}"))
+        )
+    ]
+
+    class Message:
+        tool_calls = calls
+
+        def model_dump(self, **kwargs):
+            return {"role": "assistant", "content": None}
+
+    class Compactor:
+        count = 0
+
+        async def complete(self, messages):
+            self.count += 1
+            message = (
+                Message()
+                if self.count == 1
+                else SimpleNamespace(
+                    tool_calls=[],
+                    model_dump=lambda **kwargs: {
+                        "role": "assistant",
+                        "content": "done",
+                    },
+                )
+            )
+            return SimpleNamespace(choices=[SimpleNamespace(message=message)]), messages
+
+        def reached(self, *args):
+            return False
+
+    messages = []
+    args = SimpleNamespace(
+        tool_interception_url="http://hooks/tool",
+        api_key="fixture",
+        bash=False,
+        edit=False,
+        search=False,
+    )
+    async with AsyncExitStack() as stack:
+        transport = httpx.MockTransport(receive)
+        if native_http:
+            from aiohttp import web
+            from aiohttp.test_utils import TestServer
+
+            import verifiers.v1 as vf
+            from verifiers.v1.clients import ModelContext
+            from verifiers.v1.configs.client import EvalClientConfig
+            from verifiers.v1.graph import MessageNode
+            from verifiers.v1.interception.server import InterceptionServer
+            from verifiers.v1.session import RolloutSession
+
+            trace = vf.Trace(
+                episode_id="episode",
+                agent=vf.AgentInfo(config=vf.AgentConfig()),
+                task=vf.TraceTask(type="Task", data=vf.TaskData(prompt="lookup")),
+                nodes=[
+                    MessageNode(
+                        message=vf.AssistantMessage(
+                            content=None,
+                            tool_calls=[
+                                vf.ToolCall(
+                                    id=call.id,
+                                    name=call.function.name,
+                                    arguments=call.function.arguments,
+                                )
+                                for call in calls
+                            ],
+                        ),
+                        sampled=True,
+                    )
+                ],
+            )
+            session = RolloutSession(ModelContext("model", EvalClientConfig()), trace)
+            if native_disposition == "native_http_rewrite":
+
+                async def replace_result(request: vf.Request):
+                    replacement = request.model_copy(deep=True)
+                    replacement.messages[-1].content = "intercepted result"
+                    return replacement
+
+                session.request_interceptors = [replace_result]
+            elif native_disposition == "native_http_stop":
+
+                def stop_before(request: vf.Request):
+                    return True
+
+                session.request_stops = [stop_before]
+                failure = "hook_error"
+            interception = InterceptionServer.__new__(InterceptionServer)
+            interception.sessions = {"fixture": session}
+            app = web.Application()
+            app.router.add_post("/tool", interception.handle_tool)
+            server = await stack.enter_async_context(TestServer(app))
+            args.tool_interception_url = str(server.make_url("/tool"))
+            transport = None
+        client = await stack.enter_async_context(httpx.AsyncClient(transport=transport))
+        if failure:
+            with pytest.raises(
+                asyncio.CancelledError if failure == "interrupted" else RuntimeError
+            ):
+                await core.run_chat_loop(
+                    args, Compactor(), messages, {"lookup": ("", "lookup")}, {}, client
+                )
+        else:
+            await core.run_chat_loop(
+                args, Compactor(), messages, {"lookup": ("", "lookup")}, {}, client
+            )
+        if native_http:
+            restored = vf.WireTrace.model_validate(trace.to_record())
+            payloads.extend(
+                json.loads(event.request_json)
+                for event in restored.tool_execution_events
+            )
+            assert [
+                event.receipt_seq for event in restored.tool_execution_events
+            ] == list(range(len(payloads)))
+            if native_disposition == "native_http":
+                assert [
+                    event.emitted_call_index for event in restored.tool_execution_events
+                ] == [0, 0, 0, 1, 1, 2, 2]
+    if native_disposition == "native_http_rewrite":
+        assert executed == []
+        assert [item["phase"] for item in payloads] == ["before"] * 3
+        assert len({item["execution_id"] for item in payloads}) == 3
+        assert all(
+            json.loads(event.decision_json)["action"] == "rewrite"
+            for event in restored.tool_execution_events
+        )
+        return
+    if failure == "hook_error":
+        assert executed == []
+        assert [item["phase"] for item in payloads] == ["before"]
+        return
+    assert executed == [("lookup", {})]
+    if failure == "hook_incomplete":
+        assert [item["phase"] for item in payloads] == ["before", "dispatch", "after"]
+        assert not any(item.get("role") == "tool" for item in messages)
+        return
+    if failure:
+        assert [item["phase"] for item in payloads] == ["before", "dispatch", failure]
+        assert [item["event_index"] for item in payloads] == [0, 1, 2]
+        assert len({item["execution_id"] for item in payloads}) == 1
+        assert "error" in payloads[-1] and "raw_result" not in payloads[-1]
+        return
+    assert [item["phase"] for item in payloads] == [
+        "before",
+        "dispatch",
+        "after",
+        "before",
+        "rejected",
+        "before",
+        "rejected",
+    ]
+    assert payloads[2]["raw_result"] == original
+    assert len(payloads[2]["message"]["content"]) < len(original)
+    assert len({item["execution_id"] for item in payloads}) == 3
+    assert [item["event_index"] for item in payloads] == [0, 1, 2, 0, 1, 0, 1]
 
 
 @pytest.mark.asyncio
@@ -91,6 +319,250 @@ async def test_host_client_factory_runs_local_episode_and_closes_adapter(interce
 def pair(a: str, b: str, id: str, *extra_marks):
     marks = [getattr(mark, a.replace("-", "_")), getattr(mark, b.replace("-", "_"))]
     return pytest.param(a, b, marks=[*marks, *extra_marks], id=id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.subprocess
+@pytest.mark.parametrize("colocated", [True, False])
+@pytest.mark.parametrize("invalid_first", [False, True])
+async def test_execution_ledger_runs_real_bundled_harness_and_mcp(
+    colocated, invalid_first, tmp_path
+):
+    """Host-owned inference drives real subprocess tools and native state sync."""
+    import json
+
+    import verifiers.v1 as vf
+    from verifiers.v1.assessment_source import capture_trace_source
+    from verifiers.v1.clients.client import Client
+    from verifiers.v1.clients.train import serialize_completion
+    from verifiers.v1.configs.client import EvalClientConfig
+    from verifiers.v1.trace import ToolExecutionEvent, ToolServerExecutionEvent
+    from verifiers.v1.utils.loaders import load_environment, resolve_env_config
+
+    observed, closed = [], []
+
+    class HostClient(Client):
+        async def get_response(
+            self, dialect, body, sampling, session_id=None, turn=None, headers=None
+        ):
+            results = [
+                message for message in body["messages"] if message["role"] == "tool"
+            ]
+            observed.append((session_id, [message["content"] for message in results]))
+            if len(results) < 3:
+                name = next(
+                    tool["function"]["name"]
+                    for tool in body["tools"]
+                    if tool["function"]["name"].endswith("bump")
+                )
+                # Reuse provider IDs across turns: occurrence identity must remain distinct.
+                message = vf.AssistantMessage(
+                    content=None,
+                    tool_calls=[
+                        vf.ToolCall(
+                            id="repeat",
+                            name=name,
+                            arguments="broken"
+                            if invalid_first and not results
+                            else "{}",
+                        )
+                    ],
+                )
+                finish = "tool_calls"
+            else:
+                message, finish = (
+                    vf.AssistantMessage(content="<answer>done</answer>"),
+                    "stop",
+                )
+            response = vf.Response(
+                id="host-response",
+                created=0,
+                model=body["model"],
+                message=message,
+                finish_reason=finish,
+            )
+            response.raw = serialize_completion(response, body["model"])
+            return response
+
+        async def close(self):
+            closed.append(self)
+
+    config = resolve_env_config(
+        {
+            "taskset": {
+                "id": "counter-tool-v1",
+                "task": {
+                    "tools": {"colocated": colocated, "runtime": {"type": "subprocess"}}
+                },
+            },
+            "interception": {"type": "server"},
+            "agent": {
+                "harness": {"id": "null"},
+                "runtime": {"type": "subprocess"},
+                "max_turns": 4,
+            },
+        }
+    )
+    env = load_environment(config)
+    context = vf.ModelContext(
+        "host-policy",
+        EvalClientConfig(base_url="http://127.0.0.1:1/v1"),
+        vf.Sampling(max_tokens=32),
+    )
+    async with env.serving(client_factory=lambda config: HostClient()):
+        episode = await env.run_episode(next(iter(env.taskset.load())), context)
+    assert episode.ok, (
+        episode.errors,
+        [(trace.errors, trace.stop_condition) for trace in episode.traces],
+    )
+    (trace,) = episode.traces
+    assert trace.state.count == (2 if invalid_first else 3) and trace.reward == 1.0
+    assert len(observed) == 4 and len(closed) == 1
+    if invalid_first:
+        assert observed[1][1][0].startswith("error: invalid JSON")
+        assert observed[-1][1][1:] == ["count=1", "count=2"]
+    else:
+        assert [item[1] for item in observed] == [
+            [],
+            ["count=1"],
+            ["count=1", "count=2"],
+            ["count=1", "count=2", "count=3"],
+        ]
+    all_events = trace.tool_execution_events
+    events = tuple(event for event in all_events if isinstance(event, ToolExecutionEvent))
+    server_events = tuple(event for event in all_events if isinstance(event, ToolServerExecutionEvent))
+    expected = (
+        ["before", "rejected"] if invalid_first else ["before", "dispatch", "after"]
+    ) + ["before", "dispatch", "after"] * 2
+    assert [event.phase for event in events] == expected
+    assert [event.receipt_seq for event in all_events] == list(range(len(all_events)))
+    assert len({event.execution_id for event in events}) == 3
+    assert len({event.node_index for event in events}) == 3
+    assert all(event.generated_attempt_index is None for event in events)
+    assert all(trace.nodes[event.node_index].sampled for event in events)
+    dispatches = {event.execution_id: event for event in events if event.phase == "dispatch"}
+    assert len(server_events) == (4 if invalid_first else 6)
+    for event in server_events:
+        receipt = json.loads(event.receipt_json)
+        assert receipt["parent_execution_id"] in dispatches
+        assert receipt["dispatch_ticket"]
+        assert receipt["transport_attempt_index"] == 0
+        assert receipt["server_name"] == "counter" and receipt["tool_name"] == "bump"
+        parent = dispatches[receipt["parent_execution_id"]]
+        assert trace.nodes[parent.node_index].sampled
+        assert json.loads(parent.request_json)["call"]["id"] == "repeat"
+    path = tmp_path / "native-trace.json"
+    path.write_text(json.dumps(trace.to_record()), encoding="utf-8")
+    restored = vf.WireTrace.model_validate_json(path.read_text(encoding="utf-8"))
+    assert restored.tool_execution_events == all_events
+    assert (
+        capture_trace_source(restored).source_digest
+        == capture_trace_source(trace).source_digest
+    )
+    source = capture_trace_source(restored)
+    live_source = capture_trace_source(trace)
+    resolved_parents = {}
+    for server_ref in source.executions:
+        if server_ref.origin != "tool_server":
+            continue
+        parent_ref = vf.resolve_execution_parent(source, server_ref)
+        assert parent_ref is not None and parent_ref.origin == "harness"
+        assert parent_ref.phase == "dispatch" and parent_ref.event_count == 2
+        assert parent_ref.invocation_id in dispatches
+        # Resolve the exact accepted dispatch prefix, not the later tool result.
+        prefix = vf.resolve_execution(source, parent_ref)
+        expected_prefix = tuple(event.model_dump(mode="json") for event in events
+            if event.execution_id == parent_ref.invocation_id and event.event_index <= 1)
+        assert prefix == expected_prefix and prefix[-1]["phase"] == "dispatch"
+        assert json.loads(prefix[0]["request_json"])["call"]["id"] == "repeat"
+        live_ref = next(ref for ref in live_source.executions if ref.occurrence_id == server_ref.occurrence_id)
+        assert vf.resolve_execution_parent(live_source, live_ref) == parent_ref
+        resolved_parents[server_ref.invocation_id] = parent_ref.invocation_id
+    # Reused provider IDs cannot collapse distinct sampled native dispatches.
+    assert set(resolved_parents.values()) == set(dispatches)
+    assert len(resolved_parents) == len(dispatches)
+    node_index = events[0].node_index
+    subject = vf.SubjectRef(
+        kind="call",
+        snapshot_id=source.snapshot_id,
+        episode_id=trace.episode_id,
+        trace_id=trace.id,
+        node_index=node_index,
+        node_content_digest=source.nodes[node_index].node_content_digest,
+        call_index=0,
+    )
+    assert vf.project_subject(subject, source, restored).status == "unsupported"
+
+
+@pytest.mark.asyncio
+async def test_mcp_retry_metadata_tracks_each_real_mutation_without_changing_model_args():
+    """A lost client response retries a genuine HTTP MCP call, not a mocked tool."""
+    import asyncio
+    import socket
+    from contextlib import AsyncExitStack
+
+    import uvicorn
+    from mcp.server.mcpserver import MCPServer
+
+    from verifiers.v1.harnesses.utils.mcp import MCPConnection, call_mcp
+
+    received, counts = [], []
+
+    async def metadata(ctx, call_next):
+        if ctx.method == "tools/call":
+            received.append(ctx.params)
+        return await call_next(ctx)
+
+    server = MCPServer("retry-provenance", middleware=[metadata])
+
+    @server.tool()
+    async def bump() -> str:
+        counts.append(len(counts) + 1)
+        return f"count={counts[-1]}"
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen()
+    sock.setblocking(False)
+    port = sock.getsockname()[1]
+    runtime = uvicorn.Server(uvicorn.Config(server.streamable_http_app(), log_level="error"))
+    serving = asyncio.create_task(runtime.serve(sockets=[sock]))
+    connection = MCPConnection({"url": f"http://127.0.0.1:{port}/mcp"})
+    original_run = connection.run
+    lost = False
+
+    async def retry_after_committed_mutation(operation):
+        async def invoke(client):
+            nonlocal lost
+            result = await operation(client)
+            if not lost:
+                lost = True
+                raise ConnectionError("fixture discarded first committed response")
+            return result
+        return await original_run(invoke)
+
+    connection.run = retry_after_committed_mutation
+    try:
+        async with asyncio.timeout(20), AsyncExitStack() as stack:
+            stack.push_async_callback(connection.aclose)
+            while not runtime.started:
+                if serving.done():
+                    await serving
+                await asyncio.sleep(0.01)
+            result = await call_mcp({"counter": connection}, {"counter_bump": ("counter", "bump")}, "counter_bump", {},
+                parent_execution_id="host-execution", dispatch_ticket="host-private-ticket")
+            assert result == "count=2" and counts == [1, 2]
+            assert [request["arguments"] for request in received] == [{}, {}]
+            assert [request["_meta"]["verifiers.execution"] for request in received] == [
+                {"dispatch_ticket": "host-private-ticket", "parent_execution_id": "host-execution", "transport_attempt_index": index}
+                for index in (0, 1)]
+            # Legacy callers need no provenance or added function arguments.
+            result = await call_mcp({"counter": connection}, {"counter_bump": ("counter", "bump")}, "counter_bump", {})
+            assert result == "count=3" and "verifiers.execution" not in (received[-1].get("_meta") or {})
+    finally:
+        runtime.should_exit = True
+        await serving
+        sock.close()
 
 
 # harness x harness runtime: every harness once, both local runtimes hit (subprocess
@@ -830,7 +1302,11 @@ async def test_env_client_preserves_caller_run_identity_and_acknowledges_cancel(
             )
         )
         await server.send_multipart(
-            [identity, request_id, msgpack.packb(response.model_dump(mode="json"), use_bin_type=True)]
+            [
+                identity,
+                request_id,
+                msgpack.packb(response.model_dump(mode="json"), use_bin_type=True),
+            ]
         )
         episode = await running
         assert episode.id == "episode-1"
@@ -838,12 +1314,16 @@ async def test_env_client_preserves_caller_run_identity_and_acknowledges_cancel(
         cancelling = asyncio.create_task(client.cancel("collection-1:rollout-1"))
         identity, cancel_id, method, payload = await server.recv_multipart()
         assert method == CancelRequest.method.encode()
-        assert msgpack.unpackb(payload, raw=False) == {"request_id": "collection-1:rollout-1"}
+        assert msgpack.unpackb(payload, raw=False) == {
+            "request_id": "collection-1:rollout-1"
+        }
         await server.send_multipart(
             [
                 identity,
                 cancel_id,
-                msgpack.packb(CancelResponse(cancelled=True).model_dump(), use_bin_type=True),
+                msgpack.packb(
+                    CancelResponse(cancelled=True).model_dump(), use_bin_type=True
+                ),
             ]
         )
         assert await cancelling

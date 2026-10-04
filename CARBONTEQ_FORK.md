@@ -1,5 +1,44 @@
 # CarbonTeq Verifiers distribution
 
+Current unpublished SDK isolation increment (2026-10-04): startup and thread
+configuration disable fourteen audited built-in features. Loaded-thread
+`experimentalFeature/list` readback must confirm strict false values before
+turn dispatch; the worker retains a versioned proof record. Twenty-four native
+fixtures and seven real pinned-SDK/local-provider cases pass. Independent review
+passes eight readback variants and 116 consumer backend cases. A fresh signed-in
+consumer canary passes in 14.04 seconds, with all 889 source/test hashes unchanged
+and both original action credits preserved. This qualifies the audited SDK0.160
+transport, not all future built-ins or semantic accuracy. Worker identities
+change truthfully; publication and dependency adoption remain open.
+
+Actual schema forwarding confirmation (2026-10-04): the environment's fresh
+signed-in protocol-3 probe completes with a schema-valid, source-bound answer,
+zero decision errors and one reconciled response (18,852 input/376 output,
+124 reported reasoning detail). All 743 native/environment source hashes remain
+unchanged during that attempt. This is one positive summary integration case,
+not broad semantic accuracy. Evidence lives in the consumer calibration plan's
+immutable `summary-sdk-live-03` directory; earlier failed attempts are retained.
+
+Local unpublished SDK increment (2026-10-04): the isolated qualification worker
+forwards an optional exact JSON Schema object to the pinned SDK's public
+`turn_start` as `outputSchema`. Invalid envelope types fail before credential
+copy or client dispatch; the absent-schema solver path is unchanged. Root and
+critic each pass fifteen forwarding/usage cases; the broader SDK subset passes
+eighteen with seven explicitly opt-in unpaid cases skipped. Scoped Ruff passes.
+SDK-installed Pyright still reports 83 existing notification-type diagnostics
+at the payload fallback, outside the new forwarding lines; no whole-worker
+typing or schema-adherence claim is made. Worker SHA is
+`3178b4d8f15fc634f3cf9ec901c7670119f9c3e1dbbc161844e90acc5d9f2735`.
+Actual schema-constrained model qualification and publication remain open.
+
+Local unpublished validation increment (2026-10-04): Python-mode strict receipt
+re-admission protects session retention, server emission, trace capture/export
+and selected execution projection before JSON can normalize copied fields.
+Exact sampled booleans, token masks and token IDs are required for projection.
+These are evidence-admission repairs, with no changed domain values or trainer
+advantages. Regression counts and current source hashes belong to the framework
+`execution-token-alignment-checkpoint.md`; no immutable pin is updated here.
+
 Status: independently maintained CarbonTeq distribution. Repository:
 `https://github.com/carbonteq-ai/verifiers`. Prime Intellect Verifiers remains
 an upstream source of reviewed changes, but upstream acceptance is not a release
@@ -154,3 +193,67 @@ after qualification.
 
 Published implementation commit: `b126760eadbbbbfff6eb7badca845925ee20a885`.
 Consumer revision: pending.
+
+## Local assessment source-admission candidate (2026-10-04)
+
+The unpublished credit/assessment checkout adds
+`AssessmentContext.retrospective_source()`. `execute_assessment` anchors the
+already validated supplied snapshot in private invocation state. The accessor
+freshly admits that snapshot and permits access only when all views are
+retrospective; prefix/action-result contexts and calls outside native execution
+cannot use it. The anchor is excluded from serialization, so native archives
+remain the source authority and no new wire field or schema version is added.
+
+Regression coverage is in `tests/v1/test_scoring.py`: actual native execution
+supplies the genuine source even when a custom input view has different content;
+prefix contexts cannot obtain future raw state. Selected scoring/trace/judges
+tests and scoped Ruff pass; `assessments.py` and `assessment_runtime.py` pass
+focused Pyright. Broader candidate/release qualification remains open.
+
+AutomationBench uses this seam to authenticate deterministic record, guard,
+occurrence and terminal-outcome input projections before publishing findings.
+Consumer execution and remaining gates live in the RL assessment runbook and
+`docs/tooling/verifiers/README.md`. This local work has not changed the published
+implementation commit or an immutable consumer pin.
+
+## Local intrinsic-validation reuse candidate (2026-10-04)
+
+The private `_validation_scope.py` module permits execution-owned reuse of
+successful `SourceSnapshot` and `ObservationView` intrinsic proofs. Keys retain
+exact input strings and recursively type-sensitive metadata; copied boolean,
+float or string coordinates cannot become integers through JSON readmission.
+Runtime re-admission preserves Python types before validation. Task and Env
+scoring own fresh scopes, standalone executors own or explicitly borrow a scope,
+and only the executor's exact planned child task can share it. Exit and
+cancellation close the owner and clear references. Proof storage has private
+entry and accounted-byte bounds; this is not an RSS guarantee or persisted cache.
+
+Source membership, current runs, parents, subject/prefix visibility, accepted
+findings and credit recipients remain checked on every invocation. Archive
+loading outside executor scopes still performs full validation. No public
+configuration, wire field, reward primitive or dependency was added.
+
+The selected native suite passes 153 tests with no failures/skips, scoped
+Ruff/Pyright pass, and independent critic's 30 focused intrinsic/archive-prefix
+cases pass. The RL consumer's exact recorded content score/rescore/reload test
+passes in 55.91 seconds versus the prior 195.00 seconds. Original scalar/source
+bytes and exact credit/rescore/reload checks pass; this one local workload does
+not establish training throughput or memory reduction. Whole-file hashes and remaining gates are retained in
+`docs/research/verifiers-assessment-qualification/reward-candidate/native-intrinsic-proof-qualification.json`
+in the RL repository. Candidate source remains unpublished and consumer pins
+are unchanged.
+Local unpublished increment, 2026-10-04: native MCP execution receipts can carry
+host-issued dispatch tickets and separate transport-attempt coordinates. The
+host validates original sampled call membership before server dispatch;
+`resolve_execution_parent` exposes the retained dispatch prefix. Real local
+Null/MCP retry and reload gates pass. Legacy unlinked receipts remain unlinked;
+exact token projection and publication remain open. Consumer evidence is in
+the RL checkout's `docs/research/verifiers-assessment-qualification/reward-candidate/native-parent-link-checkpoint.md`.
+
+Local unpublished execution alignment increment, 2026-10-04: execution subjects
+reuse exact generated-call projection through retained parent dispatches, keeping
+execution identity and physical retry contributions separate. Strict current
+receipt admission rejects copied boolean coordinates. Real-session coordinate
+fixtures use manufactured exact parser evidence; production renderer and consumer
+qualification remain separate. Consumer evidence:
+`docs/research/verifiers-assessment-qualification/reward-candidate/execution-token-alignment-checkpoint.md`.

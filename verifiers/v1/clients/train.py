@@ -4,15 +4,17 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from importlib.metadata import packages_distributions, version
 from typing import Any, ClassVar, TypeVar
 
 from openai import OpenAIError
 from renderers import OverlongPromptError, RenderedTokens, Renderer, RendererConfig
 from renderers.base import ToolCallParseStatus, is_multimodal
 
+from verifiers.v1.assessments import content_digest
 from verifiers.v1.clients.base import build_async_openai
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
 from verifiers.v1.clients.renderer_extensions import (
@@ -27,6 +29,8 @@ from verifiers.v1.graph import PendingTurn
 from verifiers.v1.types import (
     AssistantMessage,
     FinishReason,
+    GeneratedCallAttempt,
+    GeneratedCallProducer,
     Response,
     SamplingConfig,
     SamplingMask,
@@ -34,11 +38,24 @@ from verifiers.v1.types import (
     ToolCall,
     TurnTokens,
     Usage,
+    generated_arguments_equal,
+    generated_completion_digest,
+    validate_generated_call_links,
+    validate_generated_call_spans,
 )
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+# Resolve import-provider metadata once at module setup, never in the turn path.
+# Forks can publish a different distribution while retaining the `renderers` import.
+RENDERER_DISTRIBUTIONS = tuple(
+    (name, version(name))
+    for name in sorted(packages_distributions().get("renderers", ()))
+)
+GENERATED_CALL_PARSER_REVISION = (
+    f"renderers-packages@{content_digest(RENDERER_DISTRIBUTIONS)}/generate-prefix-spans@1"
+)
 
 
 def tool_to_wire(tool: Tool) -> dict:
@@ -102,11 +119,133 @@ def serialize_completion(response: Response, model: str) -> dict:
     }
 
 
+def _emitted_tool_calls(parsed_calls: list[Any]) -> list[ToolCall]:
+    return [
+        ToolCall(
+            id=tc.id or f"call_{i}",
+            name=tc.name,
+            arguments=tc.arguments
+            if isinstance(tc.arguments, str)
+            else json.dumps(tc.arguments or {}),
+        )
+        for i, tc in enumerate(parsed_calls)
+        if getattr(tc, "name", None)
+        # TODO: we need a better way for renderers to expose this
+        and getattr(tc, "status", None) != ToolCallParseStatus.UNKNOWN_TOOL
+    ]
+
+
+def capture_generated_calls(
+    parsed_calls: Iterable[Any],
+    completion_ids: list[int],
+    *,
+    parser_revision: str,
+    emitted_calls: list[ToolCall] | tuple[ToolCall, ...] | None = None,
+) -> tuple[GeneratedCallAttempt, ...]:
+    """Retain original parser attempts without inferring repaired message links.
+
+    The default path is the native client's known ordinal conversion. When actual
+    emitted messages are supplied, only unique matching IDs with unchanged names
+    and normalized arguments establish correlation. Unmatched/repaired attempts
+    remain available as generated evidence, without a claimed emitted occurrence.
+    """
+    parsed_calls = list(parsed_calls)
+    actual = (
+        _emitted_tool_calls(parsed_calls) if emitted_calls is None else emitted_calls
+    )
+    parsed_ids = [
+        getattr(call, "id", None) or f"call_{index}"
+        for index, call in enumerate(parsed_calls)
+    ]
+    actual_indices: dict[str, list[int]] = {}
+    for index, call in enumerate(actual):
+        actual_indices.setdefault(call.id, []).append(index)
+    completion_digest = generated_completion_digest(completion_ids)
+    spans = [getattr(call, "token_span", None) for call in parsed_calls]
+    attempts = []
+    emitted = 0
+    for index, call in enumerate(parsed_calls):
+        span = spans[index]
+        valid_span = (
+            isinstance(span, tuple)
+            and len(span) == 2
+            and all(type(value) is int for value in span)
+            and 0 <= span[0] < span[1] <= len(completion_ids)
+        )
+        fidelity = "unavailable"
+        if valid_span:
+            fidelity = (
+                "joint"
+                if any(
+                    other_index != index
+                    and isinstance(other, tuple)
+                    and len(other) == 2
+                    and all(type(value) is int for value in other)
+                    and max(span[0], other[0]) < min(span[1], other[1])
+                    for other_index, other in enumerate(spans)
+                )
+                else "exact"
+            )
+        dispatchable = (
+            bool(getattr(call, "name", None))
+            and getattr(call, "status", None) != ToolCallParseStatus.UNKNOWN_TOOL
+        )
+        arguments = getattr(call, "arguments", None)
+        normalized_arguments = (
+            arguments
+            if isinstance(arguments, str)
+            else json.dumps(arguments or {})
+            if arguments is not None
+            else None
+        )
+        emitted_index = emitted if dispatchable and emitted_calls is None else None
+        if emitted_calls is not None:
+            candidate_id = parsed_ids[index]
+            matches = actual_indices.get(candidate_id, ())
+            if parsed_ids.count(candidate_id) == 1 and len(matches) == 1:
+                actual_index = matches[0]
+                actual_call = actual[actual_index]
+                if (
+                    getattr(call, "name", None) == actual_call.name
+                    and actual_call.type == "function"
+                    and generated_arguments_equal(
+                        normalized_arguments, actual_call.arguments
+                    )
+                ):
+                    emitted_index = actual_index
+        attempts.append(
+            GeneratedCallAttempt(
+                attempt_index=index,
+                emitted_call_index=emitted_index,
+                provider_call_id=getattr(call, "id", None) or None,
+                parse_status=str(
+                    getattr(getattr(call, "status", None), "value", "unknown")
+                ),
+                raw=getattr(call, "raw", ""),
+                name=getattr(call, "name", None),
+                arguments=normalized_arguments,
+                token_span=span if valid_span else None,
+                coordinate_system="completion",
+                parser_revision=parser_revision,
+                span_fidelity=fidelity,
+                completion_token_digest=completion_digest,
+            )
+        )
+        emitted += dispatchable
+    retained = tuple(attempts)
+    validate_generated_call_links(retained, actual)
+    validate_generated_call_spans(retained)
+    return retained
+
+
 def response_from_generate(
     result: dict,
     model: str,
     bridged_turn: PendingTurn | None = None,
     mm_token_type_id_map: dict[int, int] | None = None,
+    *,
+    parser_revision: str = f"unqualified:{GENERATED_CALL_PARSER_REVISION}",
+    producer: GeneratedCallProducer | None = None,
 ) -> Response:
     """Parse a `renderers.client.generate` result dict into a typed `Response`,
     mirroring the chat client's `response_from_wire` (plus the token encoding)."""
@@ -115,21 +254,19 @@ def response_from_generate(
         if result.get("finish_reason") in FINISH_REASONS
         else None
     )
-    tool_calls = [
-        ToolCall(
-            id=tc.id or f"call_{i}",
-            name=tc.name,
-            arguments=tc.arguments
-            if isinstance(tc.arguments, str)
-            else json.dumps(tc.arguments or {}),
+    parsed_calls = result.get("tool_calls") or []
+    if producer is not None:
+        producer = GeneratedCallProducer.model_validate(
+            producer.model_dump(mode="json")
         )
-        for i, tc in enumerate(result.get("tool_calls") or [])
-        if getattr(tc, "name", None)
-        # TODO: we need a better way for renderers to expose this
-        and getattr(tc, "status", None) != ToolCallParseStatus.UNKNOWN_TOOL
-    ] or None
+        if producer.parser_revision != parser_revision:
+            raise ValueError("parser revision disagrees with retained producer")
+    tool_calls = _emitted_tool_calls(parsed_calls) or None
     prompt_ids = result.get("prompt_ids") or []
     completion_ids = result.get("completion_ids") or []
+    attempts = capture_generated_calls(
+        parsed_calls, completion_ids, parser_revision=parser_revision
+    )
     # Per-message token spans (the renderer's attribution) let the trace graph store each
     # message's tokens once; carried transiently on TurnTokens and consumed by turn.commit().
     attribution = result.get("prompt_attribution")
@@ -168,6 +305,8 @@ def response_from_generate(
             sampling_mask=SamplingMask.from_sampling_mask(mask)
             if (mask := result.get("sampling_mask"))
             else None,
+            generated_calls=attempts,
+            generated_call_producer=producer,
         ),
     )
 
@@ -468,8 +607,36 @@ class TrainClient(Client):
                 raise ProviderError(str(e), status_code=400) from e
             except OpenAIError as e:
                 raise model_error(e) from e
+        producer_descriptor = {
+            "implementation": GENERATED_CALL_PARSER_REVISION,
+            "renderer_distributions": dict(RENDERER_DISTRIBUTIONS),
+            "renderer_class": f"{type(renderer).__module__}.{type(renderer).__qualname__}",
+            "renderer": self.config.renderer.model_dump(mode="json")
+            if self.config.renderer is not None
+            else None,
+            "model": self.config.renderer_model_name or model,
+            "chat_template": self.config.chat_template,
+            "template_kwargs": chat_template_kwargs,
+            "tool_parser": (
+                f"{type(renderer._tool_parser).__module__}.{type(renderer._tool_parser).__qualname__}"
+                if getattr(renderer, "_tool_parser", None) is not None
+                else None
+            ),
+            "tools": wire_tools,
+        }
+        parser_revision = (
+            f"{GENERATED_CALL_PARSER_REVISION}:{type(renderer).__module__}.{type(renderer).__qualname__}:"
+            + content_digest(producer_descriptor)
+        )
         response = response_from_generate(
-            result, model, bridged_turn, mm_token_type_id_map
+            result,
+            model,
+            bridged_turn,
+            mm_token_type_id_map,
+            parser_revision=parser_revision,
+            producer=GeneratedCallProducer.capture(
+                parser_revision, producer_descriptor
+            ),
         )
         # No provider response to relay (we generated), so serialize one for the program; the
         # interception server hands `Response.raw` back regardless of client.

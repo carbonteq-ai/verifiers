@@ -129,3 +129,23 @@ def reward(
     `Env`'s `finalize()`, imperatively."""
     decorator = mark("reward", reward_priority=priority, _vf_weight=weight)
     return decorator if func is None else decorator(func)
+
+
+@overload
+def assessment(func: F, priority: int = 0) -> F: ...
+@overload
+def assessment(func: None = None, priority: int = 0) -> Callable[[F], F]: ...
+def assessment(func: F | None = None, priority: int = 0) -> F | Callable[[F], F]:
+    """Mark a task hook producing native assessment evidence, separate from rewards."""
+    decorator = mark("assessment", assessment_priority=priority)
+    return decorator if func is None else decorator(func)
+
+
+@overload
+def credit(func: F, priority: int = 0) -> F: ...
+@overload
+def credit(func: None = None, priority: int = 0) -> Callable[[F], F]: ...
+def credit(func: F | None = None, priority: int = 0) -> F | Callable[[F], F]:
+    """Mark a versioned domain assignment rule, separate from scalar reward."""
+    decorator = mark("credit", credit_priority=priority)
+    return decorator if func is None else decorator(func)

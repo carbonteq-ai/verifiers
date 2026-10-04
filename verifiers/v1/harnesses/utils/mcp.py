@@ -7,6 +7,7 @@ from anyio import CancelScope
 
 if TYPE_CHECKING:
     from mcp import Client
+    from mcp.types import RequestParamsMeta
 
 MCP_CALL_ATTEMPTS = 6
 MCP_TIMEOUT = 600.0
@@ -191,11 +192,31 @@ async def call_mcp(
     dispatch: dict[str, tuple[str, str]],
     name: str,
     arguments: dict[str, Any],
+    *,
+    parent_execution_id: str | None = None,
+    dispatch_ticket: str | None = None,
 ) -> str | list[dict[str, Any]]:
     """Reuse the rollout's client, reconnecting before retrying a failed call."""
     server_name, raw = dispatch[name]
 
-    result = await servers[server_name].run(
-        lambda client: client.call_tool(raw, arguments)
-    )
+    if (parent_execution_id is None) != (dispatch_ticket is None):
+        raise ValueError("MCP parent execution and dispatch ticket must be supplied together")
+    if parent_execution_id is not None and (type(parent_execution_id) is not str or not parent_execution_id
+            or type(dispatch_ticket) is not str or not dispatch_ticket):
+        raise ValueError("MCP provenance requires nonempty host-owned identifiers")
+    attempt_index = 0
+
+    async def invoke(client):
+        nonlocal attempt_index
+        if parent_execution_id is None:
+            return await client.call_tool(raw, arguments)
+        meta = cast("RequestParamsMeta", {"verifiers.execution": {
+            "dispatch_ticket": dispatch_ticket,
+            "parent_execution_id": parent_execution_id,
+            "transport_attempt_index": attempt_index,
+        }})
+        attempt_index += 1
+        return await client.call_tool(raw, arguments, meta=meta)
+
+    result = await servers[server_name].run(invoke)
     return mcp_content_to_chat_content(result.content)
