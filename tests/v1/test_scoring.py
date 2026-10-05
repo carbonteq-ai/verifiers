@@ -933,7 +933,12 @@ def _view_archive_scoring_fixture(copies=8):
     return trace, trace.model_dump(mode="python")
 
 
-def test_scoring_archive_views_are_once_per_identity_with_exact_context():
+@pytest.mark.parametrize("load_api", ["json", "python", "adapter"])
+def test_scoring_archive_views_are_once_per_identity_with_exact_context(monkeypatch, load_api):
+    from pydantic import TypeAdapter
+
+    from verifiers.v1 import assessments
+    from verifiers.v1._validation_scope import _owner, validation_scope
     from verifiers.v1.assessment_archive import normalize_history
 
     trace, legacy = _view_archive_scoring_fixture()
@@ -956,7 +961,26 @@ def test_scoring_archive_views_are_once_per_identity_with_exact_context():
     reference = payload["assessment_batches"][0]["views"][0]
     assert set(reference) == {"archive_view_ref"}
     assert "input_json" not in reference["archive_view_ref"]
-    restored = vf.WireTrace.model_validate_json(json.dumps(payload))
+    calls = []
+    original = assessments._canonical
+
+    def observed(text):
+        calls.append(text)
+        return original(text)
+
+    def load(model, data):
+        if load_api == "json":
+            return model.model_validate_json(json.dumps(data))
+        if load_api == "adapter":
+            return TypeAdapter(model).validate_python(data)
+        return model.model_validate(data)
+
+    monkeypatch.setattr(assessments, "_canonical", observed)
+    restored = load(vf.WireTrace, payload)
+    assert _owner.get() is None
+    assert calls.count(large[0]["input_json"]) == 2  # Two distinct typed views.
+    for source in payload["assessment_sources"]:
+        assert calls.count(source["source_json"]) == 1
     assert restored.assessment_batches == trace.assessment_batches
     assert (
         restored.assessment_batches[0].views[0]
@@ -982,15 +1006,23 @@ def test_scoring_archive_views_are_once_per_identity_with_exact_context():
     assert len(episode_payload["traces"][0]["assessment_views"]) == len(
         payload["assessment_views"]
     )
-    assert (
-        vf.WireEpisode.model_validate_json(
-            json.dumps(episode_payload)
-        ).assessment_batches
-        == episode.assessment_batches
-    )
+    calls.clear()
+    reloaded = load(vf.WireEpisode, episode_payload)
+    assert reloaded.assessment_batches == episode.assessment_batches
+    assert reloaded.credit_assignments == episode.credit_assignments
+    assert reloaded.traces[0].credit_assignments == trace.credit_assignments
+    assert _owner.get() is None
+    for source in episode_payload["assessment_sources"]:
+        assert calls.count(source["source_json"]) == 1
+    assert calls.count(large[0]["input_json"]) == 2
+    with validation_scope():
+        owner = _owner.get()
+        load(vf.WireEpisode, episode_payload)
+        assert _owner.get() is owner and not owner.closed
     episode_payload.pop("assessment_views")
     with pytest.raises(ValueError):
-        vf.WireEpisode.model_validate_json(json.dumps(episode_payload))
+        load(vf.WireEpisode, episode_payload)
+    assert _owner.get() is None
 
 
 def test_scoring_archive_view_body_storage_is_bounded_by_unique_views():
@@ -1281,6 +1313,40 @@ def test_intrinsic_proof_eviction_and_oversize_keep_full_validation(monkeypatch,
             source.verify()
         assert calls.count(sources[0].source_json) == 2
         assert scopes._owner.get().retained_bytes <= scopes._MAX_BYTES
+
+
+def test_compact_large_unicode_proofs_reuse_without_normalizing_content(monkeypatch):
+    from verifiers.v1 import _validation_scope as scopes
+    from verifiers.v1 import assessments
+
+    source = vf.SourceSnapshot.capture({"body": "source" * 1000 + "😀"}, episode_id="episode")
+    subject = vf.SubjectRef(kind="episode", snapshot_id=source.snapshot_id, episode_id="episode")
+    view = vf.ObservationView.capture({"body": "view" * 2000 + "😀"}, snapshot_id=source.snapshot_id,
+        builder_revision="test", scope="retrospective", subjects=(subject,))
+    calls = []
+    original = assessments._canonical
+    def observed(text):
+        calls.append(text)
+        return original(text)
+    monkeypatch.setattr(assessments, "_canonical", observed)
+    with scopes.validation_scope():
+        sizes = [scopes._size(scopes.intrinsic_proof(model).key) + 256 for model in (source, view)]
+        monkeypatch.setattr(scopes, "_MAX_BYTES", sum(sizes))
+        for _ in range(3):
+            source.verify()
+            view.verify()
+        assert calls.count(source.source_json) == 1
+        assert calls.count(view.input_json) == 1
+        assert scopes.intrinsic_proof(source).hit
+        assert scopes.intrinsic_proof(view).hit
+        assert scopes._owner.get().retained_bytes <= scopes._MAX_BYTES
+        with pytest.raises(ValueError):
+            source.model_copy(update={"source_digest": "tampered"}).verify()
+        with pytest.raises(ValueError):
+            view.model_copy(update={"input_digest": "tampered"}).verify()
+        assert scopes._typed("x" * 5000 + "é") != scopes._typed("x" * 5000 + "e\u0301")
+        surrogate = "x" * 5000 + "\ud800"
+        assert scopes._typed(surrogate)[1].decode("utf-8", errors="surrogatepass") == surrogate
 
 
 async def test_intrinsic_executor_children_reuse_but_unrelated_plans_and_reload_are_isolated(monkeypatch):

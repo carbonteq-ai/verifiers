@@ -126,12 +126,16 @@ class Episode(BaseModel, Generic[DataT, StateT, AgentConfigT]):
     )
     """Finalization evidence availability when episode assessment was planned."""
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def restore_assessment_archive(cls, value):
+    def restore_assessment_archive(cls, value, handler):
+        from verifiers.v1._validation_scope import validation_scope
         from verifiers.v1.assessment_archive import restore_history
 
-        return restore_history(value) if isinstance(value, dict) else value
+        # Keep admitted intrinsic proofs through nested model validation.
+        with validation_scope(borrow=True):
+            restored = restore_history(value) if isinstance(value, dict) else value
+            return handler(restored)
 
     @model_serializer(mode="wrap")
     def serialize_assessment_archive(self, handler, info):

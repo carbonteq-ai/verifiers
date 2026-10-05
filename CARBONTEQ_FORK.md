@@ -1,5 +1,27 @@
 # CarbonTeq Verifiers distribution
 
+Local proof-key storage follow-up (2026-10-05, unpublished): large strings use
+lossless UTF-8 with original type tags and surrogate preservation in private
+intrinsic proof keys. The unchanged 64 MiB/64-entry cache otherwise thrashed
+between approximately 40 MB source and view keys. A recorded scored DocuSign
+archive reloads in 3.89 seconds versus 84.01 seconds, with byte-identical output.
+Bounded reuse, Unicode distinction and tampering controls pass; the full native
+v1 gate passes with 83 external/opt-in skips, as do scoped Ruff and diff checks.
+No validation checks or release pins changed.
+
+Local archive-loading optimization (2026-10-05): Episode and Trace validation
+own or borrow the existing bounded exact-content proof scope through archive
+restoration and nested model validation. Source/view intrinsic proofs are reused;
+contextual batch, invocation, provenance and credit checks remain unchanged.
+The ordinary loader replays recorded 2,736-batch and 60-batch AutomationBench
+episodes in 2.08 seconds and 0.26 seconds, compared with 258.08 seconds and
+7.26 seconds before this change, with identical reserialized output hashes.
+Archive integration tests exercise JSON, Python and TypeAdapter loads, nested
+scope borrowing, retained credit and rejection cleanup. The native suite passes
+348 tests with 83 external/opt-in skips; environment regressions pass 118 tests.
+These are local archive results, not training throughput or
+lower memory usage. Publication and consumer pin adoption remain separate gates.
+
 Current unpublished SDK isolation increment (2026-10-04): startup and thread
 configuration disable fourteen audited built-in features. Loaded-thread
 `experimentalFeature/list` readback must confirm strict false values before

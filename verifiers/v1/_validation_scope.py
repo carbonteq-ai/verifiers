@@ -36,6 +36,11 @@ def _typed(value: Any) -> tuple:
         return (kind, tuple(_typed(item) for item in value))
     if kind is dict:
         return (kind, tuple((_typed(key), _typed(item)) for key, item in value.items()))
+    if kind is str and len(value) > 4096:
+        # Exact, reversible representation: a single non-BMP character can
+        # otherwise make an entire large JSON string use four bytes per codepoint.
+        # Keep the original type tag; no coordinate or content normalization.
+        return (kind, value.encode("utf-8", errors="surrogatepass"))
     if value is None or kind in {str, int, float, bool}:
         return (kind, value)
     raise ValueError("unsupported intrinsic proof metadata")

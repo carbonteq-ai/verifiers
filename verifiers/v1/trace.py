@@ -743,12 +743,16 @@ class Trace(BaseModel, Generic[DataT, StateT, AgentConfigT]):
             prior[event.execution_id] = event
         return self
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def restore_assessment_archive(cls, value):
+    def restore_assessment_archive(cls, value, handler):
+        from verifiers.v1._validation_scope import validation_scope
         from verifiers.v1.assessment_archive import restore_history
 
-        return restore_history(value) if isinstance(value, dict) else value
+        # Standalone loads own a scope; nested traces borrow the episode's.
+        with validation_scope(borrow=True):
+            restored = restore_history(value) if isinstance(value, dict) else value
+            return handler(restored)
 
     @model_serializer(mode="wrap")
     def serialize_assessment_archive(self, handler, info):
