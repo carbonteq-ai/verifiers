@@ -5,6 +5,7 @@ import msgpack
 import zmq
 import zmq.asyncio
 
+from verifiers.v1.assessment_archive import ARCHIVE_CONTEXT
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.client import ClientConfig
 from verifiers.v1.configs.env import EnvConfig
@@ -23,6 +24,22 @@ from verifiers.v1.utils.loaders import load_environment
 
 logger = logging.getLogger(__name__)
 
+
+
+
+def _pack_response(response: BaseResponse) -> bytes:
+    """Encode a reply for the wire.
+
+    Episode histories travel in the pooled assessment archive form: each full
+    source and view is sent once rather than once per assessment batch (a 49 MB
+    episode record otherwise became a 1.2 GB reply). ``EnvClient`` restores the
+    pooled form into the same validated episode.
+    """
+    return msgpack.packb(
+        response.model_dump(mode="python", context={ARCHIVE_CONTEXT: True}),
+        default=msgpack_encoder,
+        use_bin_type=True,
+    )
 
 class EnvServer:
     def __init__(
@@ -141,11 +158,7 @@ class EnvServer:
             logger.warning("request failed: %s", e, exc_info=True)
             response = BaseResponse(success=False, error=f"{type(e).__name__}: {e}")
         try:
-            data = msgpack.packb(
-                response.model_dump(mode="python"),
-                default=msgpack_encoder,
-                use_bin_type=True,
-            )
+            data = _pack_response(response)
         except Exception as e:
             # Encoding failures must also reply so clients don't wait indefinitely.
             logger.warning("response encoding failed: %s", e, exc_info=True)

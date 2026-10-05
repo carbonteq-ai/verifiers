@@ -14,7 +14,7 @@ import math
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping
 from typing import Any, Literal, Protocol, Self, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_serializer, model_validator
 
 from verifiers.v1._validation_scope import validation_owner
 from verifiers.v1.assessments import (
@@ -25,6 +25,7 @@ from verifiers.v1.assessments import (
     SourceIdentity,
     SourceSnapshot,
     SubjectRef,
+    _archive_field,
     canonical_json,
     content_digest,
 )
@@ -76,6 +77,12 @@ class CreditRequest(EvidenceRecord):
     targets: tuple[CreditTarget, ...]
     allocation: Allocation
     overlap_policy: Literal["reject", "sum"]
+
+    # No return annotation: an annotated wrap serializer replaces the field's
+    # serialization JSON schema.
+    @field_serializer("source", mode="wrap")
+    def serialize_archived_source(self, value, handler, info):
+        return _archive_field(value, handler, info)
 
     @property
     def request_id(self) -> str:

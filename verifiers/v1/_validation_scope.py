@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 _MAX_ENTRIES = 64
 _MAX_BYTES = 64 * 1024 * 1024
+_MAX_INSTANCES = 4096
 P = ParamSpec("P")
 R = TypeVar("R")
 
@@ -27,40 +28,87 @@ def _task() -> asyncio.Task[Any] | None:
         return None
 
 
+_SCALARS = frozenset({str, int, float, bool, type(None)})
+_LARGE_TEXT = 4096
+
+
 def _typed(value: Any) -> tuple:
-    """Read original Python field values; never normalize coordinate types."""
+    """Read original Python field values; never normalize coordinate types.
+
+    Strings stay in the key as the exact objects the model holds: their hash is
+    computed once per object, so repeated lookups of large retained JSON do not
+    re-encode or re-hash it, and distinct code points or lone surrogates remain
+    distinct keys.
+    """
     kind = type(value)
-    if isinstance(value, BaseModel):
-        return (kind, tuple((name, _typed(getattr(value, name))) for name in kind.model_fields))
-    if kind in {tuple, list}:
-        return (kind, tuple(_typed(item) for item in value))
-    if kind is dict:
-        return (kind, tuple((_typed(key), _typed(item)) for key, item in value.items()))
-    if kind is str and len(value) > 4096:
-        # Exact, reversible representation: a single non-BMP character can
-        # otherwise make an entire large JSON string use four bytes per codepoint.
-        # Keep the original type tag; no coordinate or content normalization.
-        return (kind, value.encode("utf-8", errors="surrogatepass"))
-    if value is None or kind in {str, int, float, bool}:
+    if kind in _SCALARS:
         return (kind, value)
+    if isinstance(value, BaseModel):
+        # Stored field values with their names: a missing, extra or reordered
+        # field yields a different key (a miss and full validation).
+        return (
+            kind,
+            tuple([(name, _typed(item)) for name, item in value.__dict__.items()]),
+        )
+    if kind is tuple or kind is list:
+        return (kind, tuple([_typed(item) for item in value]))
+    if kind is dict:
+        return (kind, tuple([(_typed(key), _typed(item)) for key, item in value.items()]))
     raise ValueError("unsupported intrinsic proof metadata")
+
+
+def _leaf_size(item: Any) -> int:
+    if isinstance(item, type):
+        return 0  # Classes already belong to loaded modules.
+    if type(item) is str and len(item) > _LARGE_TEXT:
+        # Large text is held by reference, normally shared with live models.
+        # Account one unit per code point, as compact UTF-8 would for the
+        # ASCII-dominant JSON it carries, so astral characters cannot make a
+        # single source exhaust the bound.
+        return sys.getsizeof("") + len(item)
+    return sys.getsizeof(item)
 
 
 def _size(value: tuple) -> int:
     # Account strings and constructed tuple metadata without encoding. Shared
-    # values count repeatedly; classes already belong to loaded modules. This
-    # bounds accounted proof storage rather than process resident memory.
+    # values count repeatedly. This bounds accounted proof storage rather than
+    # process resident memory.
     return sys.getsizeof(value) + sum(
-        _size(item) if type(item) is tuple else 0 if isinstance(item, type) else sys.getsizeof(item)
-        for item in value)
+        _size(item) if type(item) is tuple else _leaf_size(item) for item in value
+    )
+
+
+def _immutable(key: tuple) -> bool:
+    """Whether a typed key describes only frozen models, tuples and scalars."""
+    kind, payload = key
+    if kind in _SCALARS:
+        return True
+    if kind is tuple:
+        return all(_immutable(item) for item in payload)
+    if isinstance(kind, type) and issubclass(kind, BaseModel):
+        return kind.model_config.get("frozen") is True and all(
+            _immutable(item) for _, item in payload
+        )
+    return False
 
 
 @dataclass
 class _Owner:
     task: asyncio.Task[Any] | None
-    proofs: OrderedDict[tuple, int] = field(default_factory=OrderedDict)
+    # key -> (accounted size, whether the proven value is deeply immutable)
+    proofs: OrderedDict[tuple, tuple[int, bool]] = field(default_factory=OrderedDict)
+    # id -> (exact proven object, its proof key); ids stay unique while held.
+    instances: OrderedDict[int, tuple[BaseModel, tuple]] = field(
+        default_factory=OrderedDict
+    )
     retained_bytes: int = 0
     closed: bool = False
+
+    def remember_instance(self, model: BaseModel, key: tuple) -> None:
+        self.instances[id(model)] = (model, key)
+        self.instances.move_to_end(id(model))
+        while len(self.instances) > _MAX_INSTANCES:
+            self.instances.popitem(last=False)
 
     def allowed(self) -> bool:
         current = _task()
@@ -88,6 +136,7 @@ def validation_scope(*, borrow: bool = False) -> Iterator[None]:
     finally:
         owner.closed = True
         owner.proofs.clear()
+        owner.instances.clear()
         owner.retained_bytes = 0
         _owner.reset(token)
 
@@ -121,6 +170,7 @@ class _Proof:
     owner: _Owner | None
     key: tuple | None
     hit: bool = False
+    model: BaseModel | None = None
 
     def remember(self) -> None:
         owner, key = self.owner, self.key
@@ -129,14 +179,41 @@ class _Proof:
         size = _size(key) + 256  # Conservative entry bookkeeping allowance.
         if size > _MAX_BYTES:
             return
+        immutable = _immutable(key)
+        if immutable and self.model is not None:
+            owner.remember_instance(self.model, key)
         if key in owner.proofs:
             owner.proofs.move_to_end(key)
             return
-        owner.proofs[key] = size
+        owner.proofs[key] = (size, immutable)
         owner.retained_bytes += size
         while len(owner.proofs) > _MAX_ENTRIES or owner.retained_bytes > _MAX_BYTES:
-            _, removed = owner.proofs.popitem(last=False)
+            _, (removed, _) = owner.proofs.popitem(last=False)
             owner.retained_bytes -= removed
+
+
+def proven_instance(model: BaseModel) -> bool:
+    """Whether this exact object already passed its intrinsic checks in scope.
+
+    Only deeply immutable objects (frozen models, tuples and scalars) are
+    recorded, so the object cannot have changed since. A ``model_copy`` or a
+    re-parsed copy is a different object and is checked on its own; this
+    shortcut also skips the strict coordinate re-admission that object passed.
+    """
+    owner = _owner.get()
+    if owner is None or not owner.allowed():
+        return False
+    entry = owner.instances.get(id(model))
+    if entry is None or entry[0] is not model:
+        return False
+    # The identity shortcut lasts only while its content proof is retained, so
+    # proof eviction still forces full validation.
+    if entry[1] not in owner.proofs:
+        del owner.instances[id(model)]
+        return False
+    owner.instances.move_to_end(id(model))
+    owner.proofs.move_to_end(entry[1])
+    return True
 
 
 def intrinsic_proof(model: BaseModel) -> _Proof:
@@ -144,7 +221,10 @@ def intrinsic_proof(model: BaseModel) -> _Proof:
     if owner is None or not owner.allowed():
         return _Proof(None, None)
     key = _typed(model)
-    if key in owner.proofs:
+    entry = owner.proofs.get(key)
+    if entry is not None:
         owner.proofs.move_to_end(key)
-        return _Proof(owner, key, True)
-    return _Proof(owner, key)
+        if entry[1]:
+            owner.remember_instance(model, key)
+        return _Proof(owner, key, True, model)
+    return _Proof(owner, key, model=model)

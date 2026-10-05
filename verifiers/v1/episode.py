@@ -139,10 +139,9 @@ class Episode(BaseModel, Generic[DataT, StateT, AgentConfigT]):
 
     @model_serializer(mode="wrap")
     def serialize_assessment_archive(self, handler, info):
-        from verifiers.v1.assessment_archive import normalize_history
+        from verifiers.v1.assessment_archive import serialize_archive
 
-        data = handler(self)
-        return normalize_history(data) if info.mode == "json" else data
+        return serialize_archive(self, handler, info)
 
     @field_validator("assessment_batches")
     @classmethod

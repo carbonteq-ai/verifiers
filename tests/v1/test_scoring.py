@@ -1346,7 +1346,8 @@ def test_compact_large_unicode_proofs_reuse_without_normalizing_content(monkeypa
             view.model_copy(update={"input_digest": "tampered"}).verify()
         assert scopes._typed("x" * 5000 + "é") != scopes._typed("x" * 5000 + "e\u0301")
         surrogate = "x" * 5000 + "\ud800"
-        assert scopes._typed(surrogate)[1].decode("utf-8", errors="surrogatepass") == surrogate
+        assert scopes._typed(surrogate) == (str, surrogate)
+        assert scopes._typed(surrogate)[1] is surrogate
 
 
 async def test_intrinsic_executor_children_reuse_but_unrelated_plans_and_reload_are_isolated(monkeypatch):
@@ -1519,3 +1520,152 @@ def test_boxed_math_answer_scores_off_the_main_thread() -> None:
 
     assert results == {"correct": 1.0, "wrong": 0.0}
     assert verify_boxed_math_answer("so \\boxed{12}", "12") == 1.0
+
+
+def test_archive_serialization_elides_repeated_evidence_objects(monkeypatch):
+    import importlib
+
+    from pydantic import TypeAdapter
+
+    from verifiers.v1 import assessment_archive, assessments
+
+    credit = importlib.import_module("verifiers.v1.credit")
+    trace, _ = _view_archive_scoring_fixture()
+    batches = trace.assessment_batches
+    assert batches[0].views[0] is batches[1].views[0]
+    emitted = []
+    original_scope = assessment_archive.archive_serialization
+
+    class Recorder:
+        def __init__(self):
+            self.inner = original_scope()
+
+        def __enter__(self):
+            self.scope = self.inner.__enter__()
+            return self.scope
+
+        def __exit__(self, *exc):
+            emitted.append(self.scope.emitted)
+            return self.inner.__exit__(*exc)
+
+    monkeypatch.setattr(assessment_archive, "archive_serialization", Recorder)
+    elided = json.dumps(trace.to_record(), sort_keys=True)
+    assert emitted and emitted[-1] > 0
+    # Byte-identical to serializing every batch's evidence in full.
+    full = lambda value, handler, info: handler(value)
+    monkeypatch.setattr(assessments, "_archive_field", full)
+    monkeypatch.setattr(credit, "_archive_field", full)
+    assert json.dumps(trace.to_record(), sort_keys=True) == elided
+    monkeypatch.undo()
+    # Only the same object within one scope is elided; field filters are not.
+    pair = TypeAdapter(tuple[vf.AssessmentBatch, vf.AssessmentBatch])
+    with assessments.archive_serialization() as scope:
+        first, second = pair.dump_python((batches[0], batches[0]), mode="json")
+        assert "source_json" in first["source"]
+        assert second["source"] == {
+            assessments.ARCHIVE_SAME: [scope.token, "source", batches[0].source.snapshot_id]
+        }
+        filtered = pair.dump_python(
+            (batches[0], batches[0]), mode="json", exclude={1: {"source": {"nodes"}}}
+        )
+        assert "source_json" in filtered[1]["source"]
+        assert "nodes" not in filtered[1]["source"]
+    plain = pair.dump_python((batches[0], batches[0]), mode="json")
+    assert plain[0] == plain[1] and "source_json" in plain[1]["source"]
+    # A placeholder from another scope (or forged input) is never honored.
+    raw = trace.model_dump(mode="python")
+    raw["assessment_batches"][1]["source"] = {
+        assessments.ARCHIVE_SAME: ["forged", "source", batches[0].source.snapshot_id]
+    }
+    with pytest.raises(ValueError):
+        assessment_archive.normalize_history(raw)
+
+
+def test_archive_serialization_still_rejects_conflicting_equal_identity_copies():
+    from pydantic_core import PydanticSerializationError
+
+    trace, _ = _view_archive_scoring_fixture()
+    batches = list(trace.assessment_batches)
+    forged = batches[1].source.model_copy(update={"source_json": '{"forged":true}'})
+    batches[1] = batches[1].model_copy(update={"source": forged})
+    trace = trace.model_copy(update={"assessment_batches": batches})
+    with pytest.raises((PydanticSerializationError, ValueError)):
+        trace.to_record()
+
+
+def test_env_server_reply_pools_assessment_evidence_and_restores_identically():
+    from verifiers.v1.episode import Episode
+    from verifiers.v1.serve.client import _decode_response
+    from verifiers.v1.serve.server import _pack_response
+    from verifiers.v1.serve.types import RunResponse
+
+    trace, _ = _view_archive_scoring_fixture()
+    episode = Episode(id="episode", task=trace.task, traces=[trace])
+    # The server's reply carries the env's typed episode, serialized as itself.
+    data = _pack_response(
+        RunResponse.model_construct(success=True, error=None, episode=episode)
+    )
+    source = trace.assessment_batches[0].source
+    view = trace.assessment_batches[0].views[0]
+    assert len(trace.assessment_batches) > 2
+    assert data.count(source.source_json.encode()) == 1
+    assert data.count(view.input_json.encode()) == 2  # Two typed views share it.
+    restored = _decode_response(RunResponse, data).episode
+    assert restored.to_record() == episode.to_record()
+    assert restored.traces[0].assessment_batches == trace.assessment_batches
+
+
+def test_proven_instances_are_exact_objects_bounded_by_retained_proofs(monkeypatch):
+    from verifiers.v1 import _validation_scope as scopes
+
+    source = _execution_source()
+    with scopes.validation_scope():
+        assert not scopes.proven_instance(source)
+        source.verify()
+        assert scopes.proven_instance(source)
+        copied = source.model_copy()
+        assert not scopes.proven_instance(copied)
+        with pytest.raises(ValueError):
+            source.model_copy(update={"source_digest": "tampered"}).verify()
+        with pytest.raises(ValueError):
+            source.model_copy(
+                update={
+                    "executions": (
+                        source.executions[0].model_copy(update={"event_count": True}),
+                    )
+                }
+            ).verify()
+        scopes._owner.get().proofs.clear()
+        assert not scopes.proven_instance(source)
+    assert not scopes.proven_instance(source)
+    assert not scopes._immutable((list, ((int, 1),)))
+    assert not scopes._immutable((dict, ()))
+    assert scopes._immutable(scopes._typed(source))
+
+
+def test_batch_membership_index_matches_tuple_scan():
+    from verifiers.v1.assessments import _membership
+
+    source = _execution_source(second=True)
+    contains = _membership(source.executions)
+    assert all(contains(ref) for ref in source.executions)
+    assert not contains(source.executions[0].model_copy(update={"phase": "before"}))
+    unhashable = _membership(({"a": 1}, 2))
+    assert unhashable({"a": 1}) and unhashable(2) and not unhashable(3)
+    assert _membership((1, 2))([1]) is False
+
+
+def test_occurrence_digests_keep_copied_coordinate_types_apart():
+    ref = _execution_source().executions[0]
+    a = vf.ExecutionRef.model_construct(**(ref.__dict__ | {"invocation_id": "1"}))
+    b = vf.ExecutionRef.model_construct(**(ref.__dict__ | {"invocation_id": 1}))
+    c = vf.ExecutionRef.model_construct(**(ref.__dict__ | {"invocation_id": True}))
+    assert len({a.occurrence_id, b.occurrence_id, c.occurrence_id}) == 3
+    assert ref.occurrence_id == vf.assessments.content_digest(
+        {
+            "episode_id": ref.episode_id,
+            "trace_id": ref.trace_id,
+            "origin": ref.origin,
+            "invocation_id": ref.invocation_id,
+        }
+    )

@@ -9,7 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import AsyncIterable, Iterable
+import secrets
+from collections.abc import AsyncIterable, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Literal, Protocol, Self, cast
 
 from pydantic import (
@@ -17,11 +22,12 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    field_serializer,
     field_validator,
     model_validator,
 )
 
-from verifiers.v1._validation_scope import intrinsic_proof
+from verifiers.v1._validation_scope import intrinsic_proof, proven_instance
 
 
 def canonical_json(value: Any) -> str:
@@ -41,6 +47,98 @@ def content_digest(value: Any) -> str:
 
 def _canonical(text: str) -> str:
     return canonical_json(json.loads(text))
+
+
+ARCHIVE_SAME = "__verifiers_archive_same__"
+"""Key of an in-process placeholder for an already serialized source or view."""
+
+
+@dataclass
+class _ArchiveScope:
+    token: str
+    seen: dict[int, Any] = field(default_factory=dict)
+    emitted: int = 0
+
+
+_archive_scope: ContextVar[_ArchiveScope | None] = ContextVar(
+    "assessment_archive_scope", default=None
+)
+
+
+@contextmanager
+def archive_serialization() -> Iterator[_ArchiveScope]:
+    """Scope one archive encoding; placeholders carry the scope's token.
+
+    Within the scope, a source or view object that a batch or credit request
+    already serialized is emitted again only as a placeholder naming the token
+    and its identity. ``normalize_history`` called with the same token resolves
+    placeholders to that identity's pooled entry; foreign or stale tokens are
+    never honored. Distinct objects, even with equal content, are serialized in
+    full and compared as before.
+    """
+    scope = _ArchiveScope(secrets.token_hex(16))
+    token = _archive_scope.set(scope)
+    try:
+        yield scope
+    finally:
+        _archive_scope.reset(token)
+        scope.seen.clear()
+
+
+def _placeholder(scope: _ArchiveScope, model: Any) -> dict[str, Any] | None:
+    if isinstance(model, SourceSnapshot):
+        kind, identity = "source", model.snapshot_id
+    elif isinstance(model, ObservationView):
+        kind, identity = "view", model.view_id
+    else:
+        return None
+    if scope.seen.get(id(model)) is not model:
+        return None
+    scope.emitted += 1
+    return {ARCHIVE_SAME: [scope.token, kind, identity]}
+
+
+def _archive_field(value: Any, handler: Any, info: Any) -> Any:
+    """Serialize a source or views field, eliding objects already emitted."""
+    scope = _archive_scope.get()
+    # Field filters apply per position: filtered fields are serialized normally.
+    if scope is None or info.include is not None or info.exclude is not None:
+        return handler(value)
+    if isinstance(value, tuple):
+        marks = [_placeholder(scope, item) for item in value]
+        if marks and all(mark is not None for mark in marks):
+            return marks
+    else:
+        mark = _placeholder(scope, value)
+        if mark is not None:
+            return mark
+    data = handler(value)
+    # The scope holds each object, so its id stays unique until the scope ends.
+    for item in value if isinstance(value, tuple) else (value,):
+        if isinstance(item, (SourceSnapshot, ObservationView)):
+            scope.seen[id(item)] = item
+    return data
+
+
+def _membership(items: tuple[Any, ...]):
+    """``item in items`` through a hash set when every value hashes.
+
+    Frozen records hash their field values consistently with ``==``, so the set
+    answers exactly as the tuple scan would; unhashable (forged) values fall
+    back to the scan.
+    """
+    try:
+        index = frozenset(items)
+    except TypeError:
+        return items.__contains__
+
+    def contains(item: Any) -> bool:
+        try:
+            return item in index
+        except TypeError:
+            return item in items
+
+    return contains
 
 
 class EvidenceRecord(BaseModel):
@@ -81,14 +179,24 @@ class ExecutionRef(EvidenceRecord):
 
     @property
     def occurrence_id(self) -> str:
-        return content_digest(
-            {
-                "episode_id": self.episode_id,
-                "trace_id": self.trace_id,
-                "origin": self.origin,
-                "invocation_id": self.invocation_id,
-            }
+        return _occurrence_id(
+            self.episode_id, self.trace_id, self.origin, self.invocation_id
         )
+
+
+@lru_cache(maxsize=65536, typed=True)
+def _occurrence_id(episode_id: Any, trace_id: Any, origin: Any, invocation_id: Any) -> str:
+    # Source identities recompute every execution's occurrence on each
+    # validation. typed=True keeps True, 1 and 1.0 as separate entries, so a
+    # copied coordinate type still gets its own digest.
+    return content_digest(
+        {
+            "episode_id": episode_id,
+            "trace_id": trace_id,
+            "origin": origin,
+            "invocation_id": invocation_id,
+        }
+    )
 
 
 class SourceIdentity(EvidenceRecord):
@@ -193,6 +301,8 @@ class SourceSnapshot(EvidenceRecord):
 
     @model_validator(mode="after")
     def verify(self) -> Self:
+        if proven_instance(self):
+            return self
         if type(self.schema_version) is not int:
             raise ValueError("source schema version requires an exact integer")
         SourceIdentity.model_validate(
@@ -379,6 +489,8 @@ class ObservationView(EvidenceRecord):
 
     @model_validator(mode="after")
     def verify(self) -> Self:
+        if proven_instance(self):
+            return self
         if (type(self.subjects) is not tuple or self.scope not in {"prefix", "through_action_results", "retrospective"}
                 or any(type(value) is not str or not value for value in (
                     self.view_id, self.snapshot_id, self.builder_revision, self.input_digest))
@@ -675,6 +787,12 @@ class AssessmentBatch(EvidenceRecord):
     dependencies: tuple[Assessment, ...] = ()
     """Immutable accepted upstream records; not new replies to this run's request."""
 
+    # No return annotation: an annotated wrap serializer replaces the field's
+    # serialization JSON schema.
+    @field_serializer("source", "views", mode="wrap")
+    def serialize_archived_evidence(self, value, handler, info):
+        return _archive_field(value, handler, info)
+
     @property
     def missing(self) -> tuple[AssessmentTarget, ...]:
         returned = {assessment.key for assessment in self.assessments}
@@ -699,6 +817,7 @@ class AssessmentBatch(EvidenceRecord):
             (node.trace_id, node.node_index): node.node_content_digest
             for node in self.source.nodes
         }
+        source_executions = _membership(self.source.executions)
 
         def check_subject(subject: SubjectRef) -> None:
             if (
@@ -717,9 +836,8 @@ class AssessmentBatch(EvidenceRecord):
                 and subject.trace_id not in self.source.trace_ids
             ):
                 raise ValueError("subject belongs to an undeclared trace")
-            if (
-                subject.execution is not None
-                and subject.execution not in self.source.executions
+            if subject.execution is not None and not source_executions(
+                subject.execution
             ):
                 raise ValueError("execution prefix is absent or rewritten")
             for member in subject.members:

@@ -59,6 +59,14 @@ async def execute_assessment_plan(
     attempt_ids = {request.run.attempt_id for _, request in requests}
     if set(dependencies) - attempt_ids:
         raise ValueError("dependencies name an unplanned assessment attempt")
+    # Revalidate caller records once; attempts reuse the admitted copies.
+    dependencies = {
+        attempt: tuple(
+            Assessment.model_validate(parent.model_dump(mode="python"))
+            for parent in parents
+        )
+        for attempt, parents in dependencies.items()
+    }
     for _, request in requests:
         if request.source != source.identity:
             raise ValueError("assessment request source mismatch")
@@ -69,11 +77,9 @@ async def execute_assessment_plan(
             {
                 "source": source,
                 "run": request.run.model_dump(mode="python") | {"status": "running"},
-                "views": [view.model_dump(mode="python") for view in request.views],
-                "dependencies": [
-                    parent.model_dump(mode="python")
-                    for parent in dependencies.get(request.run.attempt_id, ())
-                ],
+                # Views were admitted from dumps above; batch checks still run.
+                "views": request.views,
+                "dependencies": dependencies.get(request.run.attempt_id, ()),
             }
         )
     semaphore = asyncio.Semaphore(max_concurrent)
@@ -92,7 +98,7 @@ async def execute_assessment_plan(
             )
 
         with planned_validation_child():
-            await execute_assessment(
+            await _execute_admitted(
                 produce,
                 request,
                 source,
@@ -127,13 +133,34 @@ async def execute_assessment(
     request = AssessmentRequest.model_validate(request.model_dump(mode="python"))
     if request.source != source.identity:
         raise ValueError("assessment request does not belong to the supplied source")
-    if any(batch.run.attempt_id == request.run.attempt_id for batch in retained):
-        raise ValueError("assessment attempt identity has already been retained")
     dependencies = tuple(
         Assessment.model_validate(parent.model_dump(mode="python"))
         for parent in dependencies
     )
     _validate_dependency_visibility(request, dependencies)
+    return await _execute_admitted(
+        producer, request, source, retained, dependencies, semaphore
+    )
+
+
+@validation_owner(borrow=True)
+async def _execute_admitted(
+    producer: Callable[..., Any] | Assessor,
+    request: AssessmentRequest,
+    source: SourceSnapshot,
+    retained: list[AssessmentBatch],
+    dependencies: tuple[Assessment, ...],
+    semaphore: asyncio.Semaphore | None,
+) -> AssessmentBatch:
+    """Run one attempt whose source, request and dependencies this module admitted.
+
+    Callers pass only models revalidated from dumps by ``execute_assessment`` or
+    ``execute_assessment_plan``, so lifecycle records reuse those immutable views
+    and dependencies instead of re-dumping them; every record still runs the
+    contextual ``AssessmentBatch`` checks.
+    """
+    if any(batch.run.attempt_id == request.run.attempt_id for batch in retained):
+        raise ValueError("assessment attempt identity has already been retained")
     context = AssessmentContext(views=request.views, dependencies=dependencies)
     context._sealed_source = source
     collected: list[Assessment] = []
@@ -186,9 +213,9 @@ async def execute_assessment(
             {
                 "source": source,
                 "run": run_values,
-                "views": [view.model_dump(mode="python") for view in request.views],
+                "views": request.views,
                 "assessments": [item.model_dump(mode="python") for item in assessments],
-                "dependencies": [item.model_dump(mode="python") for item in dependencies],
+                "dependencies": dependencies,
             }
         )
 

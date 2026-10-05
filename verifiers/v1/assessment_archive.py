@@ -9,9 +9,22 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, SerializationInfo, SerializerFunctionWrapHandler
 
-from verifiers.v1.assessments import ObservationView, SourceSnapshot
+from verifiers.v1.assessments import (
+    ARCHIVE_SAME,
+    ObservationView,
+    SourceSnapshot,
+    archive_serialization,
+)
+
+ARCHIVE_CONTEXT = "verifiers_assessment_archive"
+"""Serialization-context key requesting the pooled archive form in Python mode.
+
+JSON-mode dumps always use the pooled form. A Python-mode caller that ships the
+dump elsewhere (the env server's msgpack reply) sets this key to ``True`` so
+each full source and view travels once instead of once per batch.
+"""
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
@@ -195,7 +208,25 @@ def _views(data: dict[str, Any]) -> _Views:
     return views
 
 
-def _rewrite(data: dict[str, Any], *, restore: bool) -> dict[str, Any]:
+def _placeholder(value: Any, token: str | None, kind: str) -> str | None:
+    """The identity named by this scope's own placeholder, else ``None``."""
+    if token is None or type(value) is not dict or set(value) != {ARCHIVE_SAME}:
+        return None
+    mark = value[ARCHIVE_SAME]
+    if (
+        type(mark) is list
+        and len(mark) == 3
+        and mark[0] == token
+        and mark[1] == kind
+        and type(mark[2]) is str
+    ):
+        return mark[2]
+    return None
+
+
+def _rewrite(
+    data: dict[str, Any], *, restore: bool, token: str | None = None
+) -> tuple[dict[str, Any], int]:
     if not isinstance(data, dict):
         raise ValueError(  # noqa: TRY004 - surfaced through native model validators
             "assessment archive owner must be an object"
@@ -206,11 +237,37 @@ def _rewrite(data: dict[str, Any], *, restore: bool) -> dict[str, Any]:
     result.pop("assessment_sources", None)
     result.pop("assessment_views", None)
 
+    resolved = 0
+
     def source_value(value: Any) -> SourceSnapshot | dict[str, Any]:
+        nonlocal resolved
+        identity = _placeholder(value, token, "source")
+        if identity is not None:
+            # Emitted only for an object whose full dump this scope admitted.
+            if identity not in sources.snapshots:
+                raise ValueError("assessment archive dangling source identity")
+            resolved += 1
+            sources.used.add(identity)
+            if restore:
+                return sources.snapshots[identity]
+            return sources.identities[identity]
         snapshot = sources.resolve(value)
         return snapshot if restore else sources.identities[snapshot.snapshot_id]
 
     def view_value(value: Any) -> ObservationView | dict[str, Any]:
+        nonlocal resolved
+        identity = _placeholder(value, token, "view")
+        if identity is not None:
+            if identity not in views.views:
+                raise ValueError("assessment archive dangling view identity")
+            resolved += 1
+            views.used.add(identity)
+            view = views.views[identity]
+            if restore:
+                return view
+            if view.input_json is None:
+                return view.model_dump(mode="json")
+            return {"archive_view_ref": views.metadata[identity]}
         view = views.resolve(value)
         if restore:
             return view
@@ -266,7 +323,32 @@ def _rewrite(data: dict[str, Any], *, restore: bool) -> dict[str, Any]:
         ]
         if inline_views:
             result["assessment_views"] = inline_views
-    return result
+    return result, resolved
+
+
+def serialize_archive(
+    owner: BaseModel, handler: SerializerFunctionWrapHandler, info: SerializationInfo
+) -> Any:
+    """Serialize a Trace or Episode, pooling its histories when the mode asks for it."""
+    context = info.context
+    if info.mode != "json" and not (
+        isinstance(context, dict) and context.get(ARCHIVE_CONTEXT) is True
+    ):
+        return handler(owner)
+    with archive_serialization() as scope:
+        data = handler(owner)
+    if not scope.emitted:
+        return normalize_history(data)
+    try:
+        result, resolved = _rewrite(data, restore=False, token=scope.token)
+    except ValueError:
+        resolved = -1
+    if resolved == scope.emitted:
+        return result
+    # A placeholder outside the pooled histories, or one met before its full
+    # dump, is not resolved here: serialize again in full, which also reports
+    # any genuine archive conflict exactly as before.
+    return normalize_history(handler(owner))
 
 
 def normalize_history(data: dict[str, Any]) -> dict[str, Any]:
@@ -276,7 +358,7 @@ def normalize_history(data: dict[str, Any]) -> dict[str, Any]:
     mutation of its input. Payload strings remain shared until the wire writer.
     Already-normalized input is accepted only when all pool references validate.
     """
-    return _rewrite(data, restore=False)
+    return _rewrite(data, restore=False)[0]
 
 
 def restore_history(data: dict[str, Any]) -> dict[str, Any]:
@@ -286,4 +368,4 @@ def restore_history(data: dict[str, Any]) -> dict[str, Any]:
     models. Repeated references resolve to the same admitted snapshot/view
     objects, and no history or child-trace metadata is discarded.
     """
-    return _rewrite(data, restore=True)
+    return _rewrite(data, restore=True)[0]
