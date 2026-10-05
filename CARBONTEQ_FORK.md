@@ -1,27 +1,5 @@
 # CarbonTeq Verifiers distribution
 
-Local proof-key storage follow-up (2026-10-05, unpublished): large strings use
-lossless UTF-8 with original type tags and surrogate preservation in private
-intrinsic proof keys. The unchanged 64 MiB/64-entry cache otherwise thrashed
-between approximately 40 MB source and view keys. A recorded scored DocuSign
-archive reloads in 3.89 seconds versus 84.01 seconds, with byte-identical output.
-Bounded reuse, Unicode distinction and tampering controls pass; the full native
-v1 gate passes with 83 external/opt-in skips, as do scoped Ruff and diff checks.
-No validation checks or release pins changed.
-
-Local archive-loading optimization (2026-10-05): Episode and Trace validation
-own or borrow the existing bounded exact-content proof scope through archive
-restoration and nested model validation. Source/view intrinsic proofs are reused;
-contextual batch, invocation, provenance and credit checks remain unchanged.
-The ordinary loader replays recorded 2,736-batch and 60-batch AutomationBench
-episodes in 2.08 seconds and 0.26 seconds, compared with 258.08 seconds and
-7.26 seconds before this change, with identical reserialized output hashes.
-Archive integration tests exercise JSON, Python and TypeAdapter loads, nested
-scope borrowing, retained credit and rejection cleanup. The native suite passes
-348 tests with 83 external/opt-in skips; environment regressions pass 118 tests.
-These are local archive results, not training throughput or
-lower memory usage. Publication and consumer pin adoption remain separate gates.
-
 Current unpublished SDK isolation increment (2026-10-04): startup and thread
 configuration disable fourteen audited built-in features. Loaded-thread
 `experimentalFeature/list` readback must confirm strict false values before
@@ -255,6 +233,88 @@ fully validated, identical repeats reuse its proof, and the proofs end with the
 reply. On 20 recorded Posttrain episodes the decoded episodes are identical and
 decode CPU fell from 31.8 s to 2.1 s.
 
+### Assessment archives load with reused intrinsic proofs
+
+Episode and Trace validation own (or borrow) the bounded exact-content proof
+scope through archive restoration and nested model validation, so a pooled
+source or view that recurs across thousands of batches is fully validated once
+per load. Contextual batch, invocation, provenance and credit checks still run
+for every batch. Recorded AutomationBench archives with 2,736 and 60 batches
+load in 2.08 s and 0.26 s instead of 258.08 s and 7.26 s, with identical
+reserialized bytes; a scored DocuSign archive loads in 3.89 s instead of
+84.01 s. Source: `verifiers/v1/episode.py`, `verifiers/v1/trace.py`
+(`restore_assessment_archive` wrap validators). Regressions:
+`test_scoring_archive_views_are_once_per_identity_with_exact_context` and the
+intrinsic eviction/unicode tests in `tests/v1/test_scoring.py`.
+
+### Assessment scoring, serialization and replies on large histories
+
+AutomationBench manifest tasks retain hundreds of assessments; each attempt
+appends queued, running, partial and terminal batches that refer to one large
+source and view (about 250 KB each). Four changes remove repeated work without
+changing any retained value:
+
+- Env-server replies use the pooled archive form. `serve/server.py`
+  (`_pack_response`) packs `model_dump(mode="python")` with the
+  `ARCHIVE_CONTEXT` serialization context (`verifiers/v1/assessment_archive.py`),
+  so each full source and view travels once and batches refer to it.
+  `EnvClient` already restores the pooled form. Before, Python-mode dumps
+  bypassed pooling: a 49.4 MB episode record became a 1,174.5 MB reply and a
+  34.3 MB r6 record a 1,772.8 MB reply.
+- Archive serialization (`serialize_archive`) elides repeated objects. Inside
+  one encoding, a batch or credit request whose source or view object was
+  already serialized emits a placeholder carrying the encoding's random token
+  (`AssessmentBatch`/`CreditRequest` wrap field serializers,
+  `verifiers/v1/assessments.py`). Normalization resolves only its own token's
+  placeholders and re-serializes in full if any remains unresolved. Distinct
+  objects with equal content are still serialized and compared in full, and
+  filtered dumps are never elided. Serialization JSON schemas are unchanged.
+- Intrinsic proofs (`verifiers/v1/_validation_scope.py`) keep strings in keys by
+  reference, so large retained JSON is never re-encoded or re-hashed per lookup,
+  and account large text per code point. This replaces the earlier UTF-8 key
+  encoding with the same eviction bound. An exact object that already passed in
+  scope and is deeply immutable (frozen models, tuples, scalars) is accepted by
+  identity while its content proof is retained (`proven_instance`); a
+  `model_copy` or re-parsed copy is checked on its own. Pydantic runs `after`
+  validators even for instance inputs, so without this every lifecycle batch
+  re-ran source and view verification.
+- The plan admits source, requests and dependencies once and hands them to the
+  attempt executor (`_execute_admitted`, `verifiers/v1/assessment_runtime.py`);
+  lifecycle batches reuse those views and dependencies. Execution occurrence
+  digests are cached by exact typed coordinates, and batch execution membership
+  uses a hash index with tuple-scan fallback.
+
+Evidence on 160 retained r6 episodes (Posttrain run
+`manifest-steps-26-sampo-100-g16x8-20261005-r6`): `Episode.to_record` and
+`Trace.to_record` output is byte-identical to 24c12379 for all 160, and the
+episode decoded from the pooled reply reproduces the direct record for all 160.
+Means fall from 280 to 142 ms (`Episode.model_validate_json` in a scope), 105 to
+72 ms (`Episode.to_record`) and 104 to 64 ms (`Trace.to_record`); the reply
+averages 7.4 MB, about the record size. On the ten heaviest (34–111 MB records,
+984–3,644 batches; one process each) the means are: reply 2,322 MB to 58.5 MB,
+pack 2.37 to 0.39 s, `EnvClient` decode 5.12 to 0.91 s, decode-process peak RSS
+7.6 to 1.0 GB, `Episode.model_validate_json` 2.90 to 1.26 s, `Episode.to_record`
+899 to 416 ms and `Trace.to_record` 964 to 352 ms.
+Rescoring recorded 2.6B episodes with environment f587146 (48 from
+`manifest-steps-26-sampo-100-g16x8-20261005-r3`, 111 from
+`manifest-steps-26-g16x8-mean-20261005-r1`, plus the two heaviest manifest
+episodes) gives identical findings, rewards, metrics, Posttrain turn rewards and
+errors for all 161, ignoring only identifiers the environment draws from
+`uuid4` per run. Unprofiled scoring falls from 5.86 to 3.00 s for
+`marketing.email_blast_suppression` (551 assessments, 2,204 batches), 3.31 to
+2.19 s for `support.gorgias_inventory_routing`, and 91.9 to 72.4 s over the
+111-episode run. Retained records are unchanged by design.
+Regressions in `tests/v1/test_scoring.py`:
+`test_archive_serialization_elides_repeated_evidence_objects`,
+`test_archive_serialization_still_rejects_conflicting_equal_identity_copies`,
+`test_env_server_reply_pools_assessment_evidence_and_restores_identically`,
+`test_proven_instances_are_exact_objects_bounded_by_retained_proofs`,
+`test_batch_membership_index_matches_tuple_scan` and
+`test_occurrence_digests_keep_copied_coordinate_types_apart`.
+Implementation commits: `b50265738` (archive loading) and `d793cc6ee`
+(scoring, serialization and replies) on `codex/native-assessment-runtime-cost`;
+the consumer selection is recorded in Posttrain `docs/tooling/verifiers/README.md`.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
@@ -334,8 +394,8 @@ entry and accounted-byte bounds; this is not an RSS guarantee or persisted cache
 
 Source membership, current runs, parents, subject/prefix visibility, accepted
 findings and credit recipients remain checked on every invocation. Archive
-loading outside executor scopes still performs full validation. No public
-configuration, wire field, reward primitive or dependency was added.
+loading reuses proofs within its own load scope (see the maintained delta). No
+public configuration, wire field, reward primitive or dependency was added.
 
 The selected native suite passes 153 tests with no failures/skips, scoped
 Ruff/Pyright pass, and independent critic's 30 focused intrinsic/archive-prefix
