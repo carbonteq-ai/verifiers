@@ -19,6 +19,7 @@ import msgpack
 import zmq
 import zmq.asyncio
 
+from verifiers.v1._validation_scope import validation_scope
 from verifiers.v1.configs.client import ClientConfig
 from verifiers.v1.episode import WireEpisode
 from verifiers.v1.serve.types import (
@@ -36,6 +37,18 @@ from verifiers.v1.types import SamplingConfig
 logger = logging.getLogger(__name__)
 
 ResponseT = TypeVar("ResponseT", bound=BaseResponse)
+
+
+def _decode_response(response_type, data: bytes):
+    """Validate one reply inside a validation scope.
+
+    Episode replies repeat the same assessment sources across hundreds of
+    batches. Within the scope the first occurrence is fully validated and later
+    identical models reuse its exact-match proof, as the env server does; the
+    scope (and its proofs) ends with this one reply.
+    """
+    with validation_scope():
+        return response_type.model_validate(msgpack.unpackb(data, raw=False))
 
 
 class EnvClient:
@@ -111,11 +124,7 @@ class EnvClient:
             # Keep large trace replies compact on the loop and expand only one at a time.
             await self._decode_slots.acquire()
             decoding = asyncio.create_task(
-                asyncio.to_thread(
-                    lambda: response_type.model_validate(
-                        msgpack.unpackb(data, raw=False)
-                    )
-                )
+                asyncio.to_thread(_decode_response, response_type, data)
             )
             # Hold the slot until the worker finishes so cancellation cannot overlap decodes.
             decoding.add_done_callback(lambda _: self._decode_slots.release())
@@ -185,7 +194,9 @@ class EnvClient:
             RunResponse,
             request_id=request_id,
         )
-        assert response.episode is not None  # successful run responses always carry an episode
+        assert (
+            response.episode is not None
+        )  # successful run responses always carry an episode
         return response.episode
 
     async def cancel(self, request_id: str) -> bool:

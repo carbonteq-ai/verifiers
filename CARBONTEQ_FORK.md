@@ -221,6 +221,18 @@ receipt records those; unlinked capture is unchanged. Regression:
 `tests/v1/test_env_server.py` (its tool gains an omitted optional parameter)
 fails before the change.
 
+### Env-client replies decode inside a validation scope
+
+`EnvClient` validated each episode reply outside any validation scope, so its
+exact-match proof cache was off and every assessment batch re-validated the
+same assessment source. AutomationBench episodes carry up to about 2,200
+batches, and decoding took 2.6 CPU-s per episode on average (up to 51 s) on the
+trainer's main process. The reply is now validated inside a per-reply
+`validation_scope`, as the env server already does: the first occurrence is
+fully validated, identical repeats reuse its proof, and the proofs end with the
+reply. On 20 recorded Posttrain episodes the decoded episodes are identical and
+decode CPU fell from 31.8 s to 2.1 s.
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
