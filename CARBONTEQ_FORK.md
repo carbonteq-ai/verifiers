@@ -356,7 +356,7 @@ wheel. Publish only immutable CarbonTeq commits and move consumer pins only
 after qualification.
 
 Published release: `carbonteq-v0.3.2.dev102` (GitHub release, prerelease) at
-immutable commit `74dd3fbf1` on `codex/carbonteq-verifiers-latest`
+immutable commit `74dd3fbf176d60cb0070f2408bc8a597bbfc099e` on `codex/carbonteq-verifiers-latest`
 (`74dd3fbf1` is `58df1306` plus repository formatting, no behavior change).
 Retained wheel SHA-256
 `ce3bb4031f6a64566a9a552fed341cbbf7659f963d14b83643e909cff804489c`, source
