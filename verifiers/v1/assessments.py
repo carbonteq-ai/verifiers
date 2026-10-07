@@ -185,7 +185,9 @@ class ExecutionRef(EvidenceRecord):
 
 
 @lru_cache(maxsize=65536, typed=True)
-def _occurrence_id(episode_id: Any, trace_id: Any, origin: Any, invocation_id: Any) -> str:
+def _occurrence_id(
+    episode_id: Any, trace_id: Any, origin: Any, invocation_id: Any
+) -> str:
     # Source identities recompute every execution's occurrence on each
     # validation. typed=True keeps True, 1 and 1.0 as separate entries, so a
     # copied coordinate type still gets its own digest.
@@ -306,7 +308,10 @@ class SourceSnapshot(EvidenceRecord):
         if type(self.schema_version) is not int:
             raise ValueError("source schema version requires an exact integer")
         SourceIdentity.model_validate(
-            self.model_dump(mode="python", exclude={"schema_version", "source_json", "source_digest"}),
+            self.model_dump(
+                mode="python",
+                exclude={"schema_version", "source_json", "source_digest"},
+            ),
             strict=True,
         )
         proof = intrinsic_proof(self)
@@ -491,15 +496,28 @@ class ObservationView(EvidenceRecord):
     def verify(self) -> Self:
         if proven_instance(self):
             return self
-        if (type(self.subjects) is not tuple or self.scope not in {"prefix", "through_action_results", "retrospective"}
-                or any(type(value) is not str or not value for value in (
-                    self.view_id, self.snapshot_id, self.builder_revision, self.input_digest))
-                or self.input_json is not None and type(self.input_json) is not str):
+        if (
+            type(self.subjects) is not tuple
+            or self.scope not in {"prefix", "through_action_results", "retrospective"}
+            or any(
+                type(value) is not str or not value
+                for value in (
+                    self.view_id,
+                    self.snapshot_id,
+                    self.builder_revision,
+                    self.input_digest,
+                )
+            )
+            or self.input_json is not None
+            and type(self.input_json) is not str
+        ):
             raise ValueError("view metadata requires exact supported types")
         for subject in self.subjects:
             SubjectRef.model_validate(subject.model_dump(mode="python"), strict=True)
         if self.artifact is not None:
-            ArtifactRef.model_validate(self.artifact.model_dump(mode="python"), strict=True)
+            ArtifactRef.model_validate(
+                self.artifact.model_dump(mode="python"), strict=True
+            )
         proof = intrinsic_proof(self)
         if proof.hit:
             return self
@@ -981,7 +999,9 @@ class AssessmentContext(EvidenceRecord):
             raise ValueError("sealed source access requires retrospective views")
         if self._sealed_source is None:
             raise ValueError("sealed source is unavailable outside native execution")
-        return SourceSnapshot.model_validate(self._sealed_source.model_dump(mode="python"))
+        return SourceSnapshot.model_validate(
+            self._sealed_source.model_dump(mode="python")
+        )
 
     def record_evidence(
         self, kind: str, payload: Any, *, invocation_id: str | None = None

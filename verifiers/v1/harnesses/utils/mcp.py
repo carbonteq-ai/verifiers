@@ -200,9 +200,15 @@ async def call_mcp(
     server_name, raw = dispatch[name]
 
     if (parent_execution_id is None) != (dispatch_ticket is None):
-        raise ValueError("MCP parent execution and dispatch ticket must be supplied together")
-    if parent_execution_id is not None and (type(parent_execution_id) is not str or not parent_execution_id
-            or type(dispatch_ticket) is not str or not dispatch_ticket):
+        raise ValueError(
+            "MCP parent execution and dispatch ticket must be supplied together"
+        )
+    if parent_execution_id is not None and (
+        type(parent_execution_id) is not str
+        or not parent_execution_id
+        or type(dispatch_ticket) is not str
+        or not dispatch_ticket
+    ):
         raise ValueError("MCP provenance requires nonempty host-owned identifiers")
     attempt_index = 0
 
@@ -210,11 +216,16 @@ async def call_mcp(
         nonlocal attempt_index
         if parent_execution_id is None:
             return await client.call_tool(raw, arguments)
-        meta = cast("RequestParamsMeta", {"verifiers.execution": {
-            "dispatch_ticket": dispatch_ticket,
-            "parent_execution_id": parent_execution_id,
-            "transport_attempt_index": attempt_index,
-        }})
+        meta = cast(
+            "RequestParamsMeta",
+            {
+                "verifiers.execution": {
+                    "dispatch_ticket": dispatch_ticket,
+                    "parent_execution_id": parent_execution_id,
+                    "transport_attempt_index": attempt_index,
+                }
+            },
+        )
         attempt_index += 1
         return await client.call_tool(raw, arguments, meta=meta)
 

@@ -320,13 +320,30 @@ async def test_retrospective_context_has_executor_source_independent_of_transfor
 
     source = _execution_source()
     subject = _execution_subject(source)
-    view = vf.ObservationView.capture({"transformed": "assessor-specific input"},
-        snapshot_id=source.snapshot_id, builder_revision="custom", scope="retrospective", subjects=(subject,))
-    signal = vf.SignalDefinition(signal_id="anchor", revision="1", semantics="other",
-        description="sealed source access", units="indicator")
-    run = vf.AssessmentRun(run_id="anchor-run", producer_id="deterministic", producer_revision="1",
-        rubric_revision="1", snapshot_id=source.snapshot_id, invocation_id="anchor-call", attempt_id="anchor-attempt",
-        expected=(vf.AssessmentTarget(subject=subject, signal=signal),))
+    view = vf.ObservationView.capture(
+        {"transformed": "assessor-specific input"},
+        snapshot_id=source.snapshot_id,
+        builder_revision="custom",
+        scope="retrospective",
+        subjects=(subject,),
+    )
+    signal = vf.SignalDefinition(
+        signal_id="anchor",
+        revision="1",
+        semantics="other",
+        description="sealed source access",
+        units="indicator",
+    )
+    run = vf.AssessmentRun(
+        run_id="anchor-run",
+        producer_id="deterministic",
+        producer_revision="1",
+        rubric_revision="1",
+        snapshot_id=source.snapshot_id,
+        invocation_id="anchor-call",
+        attempt_id="anchor-attempt",
+        expected=(vf.AssessmentTarget(subject=subject, signal=signal),),
+    )
     request = vf.AssessmentRequest(source=source.identity, run=run, views=(view,))
     with pytest.raises(ValueError, match="outside native execution"):
         vf.AssessmentContext(views=(view,)).retrospective_source()
@@ -337,8 +354,17 @@ async def test_retrospective_context_has_executor_source_independent_of_transfor
         assert actual.identity == request.source
         assert context.input(view.view_id) == {"transformed": "assessor-specific input"}
         assert "sealed_source" not in context.model_dump_json()
-        return (vf.Assessment(assessment_id="anchor-finding", run_id=run.run_id, subject=subject,
-            view_id=view.view_id, signal=signal, status="valid", value=1),)
+        return (
+            vf.Assessment(
+                assessment_id="anchor-finding",
+                run_id=run.run_id,
+                subject=subject,
+                view_id=view.view_id,
+                signal=signal,
+                status="valid",
+                value=1,
+            ),
+        )
 
     batch = await execute_assessment(assess, request, source, [])
     assert batch.run.status == "complete" and batch.assessments[0].value == 1
@@ -934,7 +960,9 @@ def _view_archive_scoring_fixture(copies=8):
 
 
 @pytest.mark.parametrize("load_api", ["json", "python", "adapter"])
-def test_scoring_archive_views_are_once_per_identity_with_exact_context(monkeypatch, load_api):
+def test_scoring_archive_views_are_once_per_identity_with_exact_context(
+    monkeypatch, load_api
+):
     from pydantic import TypeAdapter
 
     from verifiers.v1 import assessments
@@ -1216,15 +1244,21 @@ def test_source_snapshot_integer_schema_preserves_native_and_legacy_roundtrips(
 
 @pytest.mark.parametrize("coordinate", [True, 1.0, "1"])
 @pytest.mark.parametrize("warm", [False, True])
-def test_intrinsic_source_proofs_reject_raw_and_copied_coordinate_coercion(coordinate, warm):
+def test_intrinsic_source_proofs_reject_raw_and_copied_coordinate_coercion(
+    coordinate, warm
+):
     from verifiers.v1._validation_scope import validation_scope
 
     node = vf.NodeRef(trace_id="trace", node_index=1, node_content_digest="node")
-    source = vf.SourceSnapshot.capture({}, episode_id="episode", nodes=(node,), trace_ids=("trace",))
+    source = vf.SourceSnapshot.capture(
+        {}, episode_id="episode", nodes=(node,), trace_ids=("trace",)
+    )
     with validation_scope():
         if warm:
             source.verify()
-        copied = source.model_copy(update={"nodes": (node.model_copy(update={"node_index": coordinate}),)})
+        copied = source.model_copy(
+            update={"nodes": (node.model_copy(update={"node_index": coordinate}),)}
+        )
         with pytest.raises(ValueError):
             copied.verify()
         raw = source.model_dump(mode="python")
@@ -1234,21 +1268,65 @@ def test_intrinsic_source_proofs_reject_raw_and_copied_coordinate_coercion(coord
 
 
 @pytest.mark.parametrize("coordinate", [True, 1.0, "1"])
-@pytest.mark.parametrize("field", ["node_index", "call_index", "span_start", "span_end"])
-def test_intrinsic_view_proofs_reject_nested_group_coordinate_coercion(coordinate, field):
+@pytest.mark.parametrize(
+    "field", ["node_index", "call_index", "span_start", "span_end"]
+)
+def test_intrinsic_view_proofs_reject_nested_group_coordinate_coercion(
+    coordinate, field
+):
     from verifiers.v1._validation_scope import validation_scope
 
-    kind = "call" if field == "call_index" else "span" if field.startswith("span") else "turn"
-    extra = {"call_index": 1} if kind == "call" else {
-        "span_start": 1, "span_end": 2, "representation": "full_tokens", "representation_digest": "tokens"} if kind == "span" else {}
-    subject = vf.SubjectRef(kind=kind, snapshot_id="snapshot", episode_id="episode", trace_id="trace",
-                            node_index=1, node_content_digest="node", **extra)
-    group = vf.SubjectRef(kind="group", snapshot_id="snapshot", episode_id="episode", members=(subject,))
-    view = vf.ObservationView.capture({}, snapshot_id="snapshot", builder_revision="typed", scope="retrospective", subjects=(group,))
+    kind = (
+        "call"
+        if field == "call_index"
+        else "span"
+        if field.startswith("span")
+        else "turn"
+    )
+    extra = (
+        {"call_index": 1}
+        if kind == "call"
+        else {
+            "span_start": 1,
+            "span_end": 2,
+            "representation": "full_tokens",
+            "representation_digest": "tokens",
+        }
+        if kind == "span"
+        else {}
+    )
+    subject = vf.SubjectRef(
+        kind=kind,
+        snapshot_id="snapshot",
+        episode_id="episode",
+        trace_id="trace",
+        node_index=1,
+        node_content_digest="node",
+        **extra,
+    )
+    group = vf.SubjectRef(
+        kind="group", snapshot_id="snapshot", episode_id="episode", members=(subject,)
+    )
+    view = vf.ObservationView.capture(
+        {},
+        snapshot_id="snapshot",
+        builder_revision="typed",
+        scope="retrospective",
+        subjects=(group,),
+    )
     with validation_scope():
         view.verify()
-        copied = view.model_copy(update={"subjects": (group.model_copy(update={"members": (
-            subject.model_copy(update={field: coordinate}),)}),)})
+        copied = view.model_copy(
+            update={
+                "subjects": (
+                    group.model_copy(
+                        update={
+                            "members": (subject.model_copy(update={field: coordinate}),)
+                        }
+                    ),
+                )
+            }
+        )
         with pytest.raises(ValueError):
             copied.verify()
         raw = view.model_dump(mode="python")
@@ -1264,7 +1342,13 @@ def test_intrinsic_source_proof_rejects_copied_execution_count(count):
     source = _execution_source()
     with validation_scope():
         source.verify()
-        copied = source.model_copy(update={"executions": (source.executions[0].model_copy(update={"event_count": count}),)})
+        copied = source.model_copy(
+            update={
+                "executions": (
+                    source.executions[0].model_copy(update={"event_count": count}),
+                )
+            }
+        )
         with pytest.raises(ValueError):
             copied.verify()
 
@@ -1276,17 +1360,23 @@ def test_intrinsic_proof_hits_require_exact_body_metadata_and_success(monkeypatc
     source = vf.SourceSnapshot.capture({"body": "original"}, episode_id="episode")
     calls = []
     original = assessments._canonical
+
     def observed(text):
         calls.append(text)
         return original(text)
+
     monkeypatch.setattr(assessments, "_canonical", observed)
     with validation_scope():
         source.verify()
         source.verify()
         assert calls.count(source.source_json) == 1
         owner = _owner.get()
-        for changes in ({"source_json": '{"body":"changed"}'}, {"source_digest": "changed"},
-                        {"episode_id": "other"}, {"snapshot_id": "other"}):
+        for changes in (
+            {"source_json": '{"body":"changed"}'},
+            {"source_digest": "changed"},
+            {"episode_id": "other"},
+            {"snapshot_id": "other"},
+        ):
             with pytest.raises(ValueError):
                 source.model_copy(update=changes).verify()
         assert len(owner.proofs) == 1
@@ -1300,14 +1390,21 @@ def test_intrinsic_proof_eviction_and_oversize_keep_full_validation(monkeypatch,
     from verifiers.v1 import _validation_scope as scopes
     from verifiers.v1 import assessments
 
-    sources = [vf.SourceSnapshot.capture({"body": str(index)}, episode_id="episode") for index in range(2)]
+    sources = [
+        vf.SourceSnapshot.capture({"body": str(index)}, episode_id="episode")
+        for index in range(2)
+    ]
     calls = []
     original = assessments._canonical
+
     def observed(text):
         calls.append(text)
         return original(text)
+
     monkeypatch.setattr(assessments, "_canonical", observed)
-    monkeypatch.setattr(scopes, "_MAX_ENTRIES" if limit == "entries" else "_MAX_BYTES", 1)
+    monkeypatch.setattr(
+        scopes, "_MAX_ENTRIES" if limit == "entries" else "_MAX_BYTES", 1
+    )
     with scopes.validation_scope():
         for source in (*sources, sources[0]):
             source.verify()
@@ -1319,18 +1416,32 @@ def test_compact_large_unicode_proofs_reuse_without_normalizing_content(monkeypa
     from verifiers.v1 import _validation_scope as scopes
     from verifiers.v1 import assessments
 
-    source = vf.SourceSnapshot.capture({"body": "source" * 1000 + "😀"}, episode_id="episode")
-    subject = vf.SubjectRef(kind="episode", snapshot_id=source.snapshot_id, episode_id="episode")
-    view = vf.ObservationView.capture({"body": "view" * 2000 + "😀"}, snapshot_id=source.snapshot_id,
-        builder_revision="test", scope="retrospective", subjects=(subject,))
+    source = vf.SourceSnapshot.capture(
+        {"body": "source" * 1000 + "😀"}, episode_id="episode"
+    )
+    subject = vf.SubjectRef(
+        kind="episode", snapshot_id=source.snapshot_id, episode_id="episode"
+    )
+    view = vf.ObservationView.capture(
+        {"body": "view" * 2000 + "😀"},
+        snapshot_id=source.snapshot_id,
+        builder_revision="test",
+        scope="retrospective",
+        subjects=(subject,),
+    )
     calls = []
     original = assessments._canonical
+
     def observed(text):
         calls.append(text)
         return original(text)
+
     monkeypatch.setattr(assessments, "_canonical", observed)
     with scopes.validation_scope():
-        sizes = [scopes._size(scopes.intrinsic_proof(model).key) + 256 for model in (source, view)]
+        sizes = [
+            scopes._size(scopes.intrinsic_proof(model).key) + 256
+            for model in (source, view)
+        ]
         monkeypatch.setattr(scopes, "_MAX_BYTES", sum(sizes))
         for _ in range(3):
             source.verify()
@@ -1350,37 +1461,86 @@ def test_compact_large_unicode_proofs_reuse_without_normalizing_content(monkeypa
         assert scopes._typed(surrogate)[1] is surrogate
 
 
-async def test_intrinsic_executor_children_reuse_but_unrelated_plans_and_reload_are_isolated(monkeypatch):
+async def test_intrinsic_executor_children_reuse_but_unrelated_plans_and_reload_are_isolated(
+    monkeypatch,
+):
     from verifiers.v1 import assessments
     from verifiers.v1.assessment_runtime import execute_assessment_plan
 
     source = _execution_source()
     subject = _execution_subject(source)
-    view = vf.ObservationView.capture({"working": "input"}, snapshot_id=source.snapshot_id,
-        builder_revision="private-proof-test", scope="retrospective", subjects=(subject,))
-    signal = vf.SignalDefinition(signal_id="proof", revision="1", semantics="other", description="proof", units="binary")
+    view = vf.ObservationView.capture(
+        {"working": "input"},
+        snapshot_id=source.snapshot_id,
+        builder_revision="private-proof-test",
+        scope="retrospective",
+        subjects=(subject,),
+    )
+    signal = vf.SignalDefinition(
+        signal_id="proof",
+        revision="1",
+        semantics="other",
+        description="proof",
+        units="binary",
+    )
+
     def requests(prefix):
-        return [("assess", vf.AssessmentRequest(source=source.identity, views=(view,), run=vf.AssessmentRun(
-            run_id=f"{prefix}-run-{index}", producer_id="deterministic", producer_revision="1", rubric_revision="1",
-            snapshot_id=source.snapshot_id, invocation_id=f"{prefix}-call-{index}", attempt_id=f"{prefix}-attempt-{index}",
-            expected=(vf.AssessmentTarget(subject=subject, signal=signal),)))) for index in range(2)]
+        return [
+            (
+                "assess",
+                vf.AssessmentRequest(
+                    source=source.identity,
+                    views=(view,),
+                    run=vf.AssessmentRun(
+                        run_id=f"{prefix}-run-{index}",
+                        producer_id="deterministic",
+                        producer_revision="1",
+                        rubric_revision="1",
+                        snapshot_id=source.snapshot_id,
+                        invocation_id=f"{prefix}-call-{index}",
+                        attempt_id=f"{prefix}-attempt-{index}",
+                        expected=(vf.AssessmentTarget(subject=subject, signal=signal),),
+                    ),
+                ),
+            )
+            for index in range(2)
+        ]
+
     def assess(request, context):
         assert context.retrospective_source() == source
-        return (vf.Assessment(assessment_id=request.run.run_id, run_id=request.run.run_id, subject=subject,
-            view_id=view.view_id, signal=signal, status="valid", value=1),)
+        return (
+            vf.Assessment(
+                assessment_id=request.run.run_id,
+                run_id=request.run.run_id,
+                subject=subject,
+                view_id=view.view_id,
+                signal=signal,
+                status="valid",
+                value=1,
+            ),
+        )
+
     plans = [requests("a"), requests("b")]
     calls = []
     original = assessments._canonical
+
     def observed(text):
         calls.append(text)
         return original(text)
+
     monkeypatch.setattr(assessments, "_canonical", observed)
     left, right = [], []
-    await asyncio.gather(execute_assessment_plan({"assess": assess}, plans[0], source, left, 2),
-                         execute_assessment_plan({"assess": assess}, plans[1], source, right, 2))
+    await asyncio.gather(
+        execute_assessment_plan({"assess": assess}, plans[0], source, left, 2),
+        execute_assessment_plan({"assess": assess}, plans[1], source, right, 2),
+    )
     assert calls.count(source.source_json) == 2
     assert calls.count(view.input_json) == 2
-    assert all(batch.run.status == "complete" for batch in (*left, *right) if batch.run.status in {"complete", "failed"})
+    assert all(
+        batch.run.status == "complete"
+        for batch in (*left, *right)
+        if batch.run.status in {"complete", "failed"}
+    )
     before = calls.count(source.source_json)
     vf.AssessmentBatch.model_validate_json(left[-1].model_dump_json())
     assert calls.count(source.source_json) > before
@@ -1398,24 +1558,29 @@ async def test_intrinsic_owner_rejects_sibling_inheritance_and_escaped_child_aft
     started, finish = asyncio.Event(), asyncio.Event()
     escaped = []
     owners = []
+
     async def child():
         await finish.wait()
         assert not intrinsic_proof(source).hit
         with validation_scope(borrow=True):
             assert _owner.get() is not owners[0]
             source.verify()
+
     @validation_owner()
     async def parent():
         source.verify()
         owners.append(_owner.get())
+
         async def sibling():
             assert not intrinsic_proof(source).hit
             with validation_scope(borrow=True):
                 assert _owner.get() is not owners[0]
+
         await asyncio.create_task(sibling())
         escaped.append(asyncio.create_task(child()))
         started.set()
         await asyncio.Event().wait()
+
     pending = asyncio.create_task(parent())
     await started.wait()
     pending.cancel()
@@ -1430,22 +1595,64 @@ async def test_intrinsic_owner_rejects_sibling_inheritance_and_escaped_child_aft
 async def test_intrinsic_cached_source_cannot_launder_copied_producer_coordinate():
     from verifiers.v1.assessment_runtime import execute_assessment
 
-    source = vf.SourceSnapshot.capture({}, episode_id="episode", trace_ids=("trace",),
-        nodes=(vf.NodeRef(trace_id="trace", node_index=1, node_content_digest="node"),))
-    subject = vf.SubjectRef(kind="call", snapshot_id=source.snapshot_id, episode_id="episode", trace_id="trace",
-        node_index=1, node_content_digest="node", call_index=1)
-    view = vf.ObservationView.capture({}, snapshot_id=source.snapshot_id, builder_revision="typed-producer",
-        scope="retrospective", subjects=(subject,))
-    signal = vf.SignalDefinition(signal_id="typed", revision="1", semantics="other", description="typed", units="binary")
-    run = vf.AssessmentRun(run_id="typed-run", producer_id="typed", producer_revision="1", rubric_revision="1",
-        snapshot_id=source.snapshot_id, invocation_id="typed-call", attempt_id="typed-attempt",
-        expected=(vf.AssessmentTarget(subject=subject, signal=signal),))
+    source = vf.SourceSnapshot.capture(
+        {},
+        episode_id="episode",
+        trace_ids=("trace",),
+        nodes=(vf.NodeRef(trace_id="trace", node_index=1, node_content_digest="node"),),
+    )
+    subject = vf.SubjectRef(
+        kind="call",
+        snapshot_id=source.snapshot_id,
+        episode_id="episode",
+        trace_id="trace",
+        node_index=1,
+        node_content_digest="node",
+        call_index=1,
+    )
+    view = vf.ObservationView.capture(
+        {},
+        snapshot_id=source.snapshot_id,
+        builder_revision="typed-producer",
+        scope="retrospective",
+        subjects=(subject,),
+    )
+    signal = vf.SignalDefinition(
+        signal_id="typed",
+        revision="1",
+        semantics="other",
+        description="typed",
+        units="binary",
+    )
+    run = vf.AssessmentRun(
+        run_id="typed-run",
+        producer_id="typed",
+        producer_revision="1",
+        rubric_revision="1",
+        snapshot_id=source.snapshot_id,
+        invocation_id="typed-call",
+        attempt_id="typed-attempt",
+        expected=(vf.AssessmentTarget(subject=subject, signal=signal),),
+    )
     request = vf.AssessmentRequest(source=source.identity, run=run, views=(view,))
+
     def malformed(request, context):
         context.retrospective_source()
-        parent = vf.Assessment(assessment_id="typed-result", run_id=run.run_id, subject=subject,
-            view_id=view.view_id, signal=signal, status="valid", value=1)
-        return (parent.model_copy(update={"subject": subject.model_copy(update={"call_index": True})}),)
+        parent = vf.Assessment(
+            assessment_id="typed-result",
+            run_id=run.run_id,
+            subject=subject,
+            view_id=view.view_id,
+            signal=signal,
+            status="valid",
+            value=1,
+        )
+        return (
+            parent.model_copy(
+                update={"subject": subject.model_copy(update={"call_index": True})}
+            ),
+        )
+
     batch = await execute_assessment(malformed, request, source, [])
     assert batch.run.status == "failed" and not batch.assessments
 
@@ -1455,6 +1662,7 @@ async def test_intrinsic_task_and_episode_scores_have_fresh_owners(api):
     from verifiers.v1._validation_scope import _owner, validation_scope
 
     observed = []
+
     class CreditOnlyTask(HookTask):
         def assessment_source(self, trace):
             observed.append(_owner.get())
@@ -1485,7 +1693,11 @@ async def test_intrinsic_task_and_episode_scores_have_fresh_owners(api):
             return ()
 
     task = CreditOnlyTask(HookData(idx=0, prompt="task"))
-    trace = vf.Trace(episode_id="owner-test", task=vf.TraceTask(type="CreditOnlyTask", data=task.data), agent=vf.AgentInfo(config=vf.AgentConfig()))
+    trace = vf.Trace(
+        episode_id="owner-test",
+        task=vf.TraceTask(type="CreditOnlyTask", data=task.data),
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+    )
     with validation_scope():
         outer = _owner.get()
         for _ in range(2):
@@ -1494,10 +1706,16 @@ async def test_intrinsic_task_and_episode_scores_have_fresh_owners(api):
             else:
                 episode = vf.Episode(id="owner-test", task=trace.task, traces=[trace])
                 env = object.__new__(CreditOnlyEnv)
-                await env.score_assessments(task, episode, finalization_state="complete")
+                await env.score_assessments(
+                    task, episode, finalization_state="complete"
+                )
                 assert not episode.assessment_errors and not episode.credit_errors
             assert _owner.get() is outer
-            assert observed[-1] is not outer and observed[-1].closed and not observed[-1].proofs
+            assert (
+                observed[-1] is not outer
+                and observed[-1].closed
+                and not observed[-1].proofs
+            )
         assert observed[0] is not observed[1]
 
 
@@ -1563,7 +1781,11 @@ def test_archive_serialization_elides_repeated_evidence_objects(monkeypatch):
         first, second = pair.dump_python((batches[0], batches[0]), mode="json")
         assert "source_json" in first["source"]
         assert second["source"] == {
-            assessments.ARCHIVE_SAME: [scope.token, "source", batches[0].source.snapshot_id]
+            assessments.ARCHIVE_SAME: [
+                scope.token,
+                "source",
+                batches[0].source.snapshot_id,
+            ]
         }
         filtered = pair.dump_python(
             (batches[0], batches[0]), mode="json", exclude={1: {"source": {"nodes"}}}

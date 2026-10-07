@@ -429,8 +429,12 @@ async def test_execution_ledger_runs_real_bundled_harness_and_mcp(
             ["count=1", "count=2", "count=3"],
         ]
     all_events = trace.tool_execution_events
-    events = tuple(event for event in all_events if isinstance(event, ToolExecutionEvent))
-    server_events = tuple(event for event in all_events if isinstance(event, ToolServerExecutionEvent))
+    events = tuple(
+        event for event in all_events if isinstance(event, ToolExecutionEvent)
+    )
+    server_events = tuple(
+        event for event in all_events if isinstance(event, ToolServerExecutionEvent)
+    )
     expected = (
         ["before", "rejected"] if invalid_first else ["before", "dispatch", "after"]
     ) + ["before", "dispatch", "after"] * 2
@@ -440,7 +444,9 @@ async def test_execution_ledger_runs_real_bundled_harness_and_mcp(
     assert len({event.node_index for event in events}) == 3
     assert all(event.generated_attempt_index is None for event in events)
     assert all(trace.nodes[event.node_index].sampled for event in events)
-    dispatches = {event.execution_id: event for event in events if event.phase == "dispatch"}
+    dispatches = {
+        event.execution_id: event for event in events if event.phase == "dispatch"
+    }
     assert len(server_events) == (4 if invalid_first else 6)
     for event in server_events:
         receipt = json.loads(event.receipt_json)
@@ -471,11 +477,18 @@ async def test_execution_ledger_runs_real_bundled_harness_and_mcp(
         assert parent_ref.invocation_id in dispatches
         # Resolve the exact accepted dispatch prefix, not the later tool result.
         prefix = vf.resolve_execution(source, parent_ref)
-        expected_prefix = tuple(event.model_dump(mode="json") for event in events
-            if event.execution_id == parent_ref.invocation_id and event.event_index <= 1)
+        expected_prefix = tuple(
+            event.model_dump(mode="json")
+            for event in events
+            if event.execution_id == parent_ref.invocation_id and event.event_index <= 1
+        )
         assert prefix == expected_prefix and prefix[-1]["phase"] == "dispatch"
         assert json.loads(prefix[0]["request_json"])["call"]["id"] == "repeat"
-        live_ref = next(ref for ref in live_source.executions if ref.occurrence_id == server_ref.occurrence_id)
+        live_ref = next(
+            ref
+            for ref in live_source.executions
+            if ref.occurrence_id == server_ref.occurrence_id
+        )
         assert vf.resolve_execution_parent(live_source, live_ref) == parent_ref
         resolved_parents[server_ref.invocation_id] = parent_ref.invocation_id
     # Reused provider IDs cannot collapse distinct sampled native dispatches.
@@ -525,7 +538,9 @@ async def test_mcp_retry_metadata_tracks_each_real_mutation_without_changing_mod
     sock.listen()
     sock.setblocking(False)
     port = sock.getsockname()[1]
-    runtime = uvicorn.Server(uvicorn.Config(server.streamable_http_app(), log_level="error"))
+    runtime = uvicorn.Server(
+        uvicorn.Config(server.streamable_http_app(), log_level="error")
+    )
     serving = asyncio.create_task(runtime.serve(sockets=[sock]))
     connection = MCPConnection({"url": f"http://127.0.0.1:{port}/mcp"})
     original_run = connection.run
@@ -539,6 +554,7 @@ async def test_mcp_retry_metadata_tracks_each_real_mutation_without_changing_mod
                 lost = True
                 raise ConnectionError("fixture discarded first committed response")
             return result
+
         return await original_run(invoke)
 
     connection.run = retry_after_committed_mutation
@@ -549,16 +565,36 @@ async def test_mcp_retry_metadata_tracks_each_real_mutation_without_changing_mod
                 if serving.done():
                     await serving
                 await asyncio.sleep(0.01)
-            result = await call_mcp({"counter": connection}, {"counter_bump": ("counter", "bump")}, "counter_bump", {},
-                parent_execution_id="host-execution", dispatch_ticket="host-private-ticket")
+            result = await call_mcp(
+                {"counter": connection},
+                {"counter_bump": ("counter", "bump")},
+                "counter_bump",
+                {},
+                parent_execution_id="host-execution",
+                dispatch_ticket="host-private-ticket",
+            )
             assert result == "count=2" and counts == [1, 2]
             assert [request["arguments"] for request in received] == [{}, {}]
-            assert [request["_meta"]["verifiers.execution"] for request in received] == [
-                {"dispatch_ticket": "host-private-ticket", "parent_execution_id": "host-execution", "transport_attempt_index": index}
-                for index in (0, 1)]
+            assert [
+                request["_meta"]["verifiers.execution"] for request in received
+            ] == [
+                {
+                    "dispatch_ticket": "host-private-ticket",
+                    "parent_execution_id": "host-execution",
+                    "transport_attempt_index": index,
+                }
+                for index in (0, 1)
+            ]
             # Legacy callers need no provenance or added function arguments.
-            result = await call_mcp({"counter": connection}, {"counter_bump": ("counter", "bump")}, "counter_bump", {})
-            assert result == "count=3" and "verifiers.execution" not in (received[-1].get("_meta") or {})
+            result = await call_mcp(
+                {"counter": connection},
+                {"counter_bump": ("counter", "bump")},
+                "counter_bump",
+                {},
+            )
+            assert result == "count=3" and "verifiers.execution" not in (
+                received[-1].get("_meta") or {}
+            )
     finally:
         runtime.should_exit = True
         await serving

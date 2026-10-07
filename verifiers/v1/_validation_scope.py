@@ -53,7 +53,10 @@ def _typed(value: Any) -> tuple:
     if kind is tuple or kind is list:
         return (kind, tuple([_typed(item) for item in value]))
     if kind is dict:
-        return (kind, tuple([(_typed(key), _typed(item)) for key, item in value.items()]))
+        return (
+            kind,
+            tuple([(_typed(key), _typed(item)) for key, item in value.items()]),
+        )
     raise ValueError("unsupported intrinsic proof metadata")
 
 
@@ -113,8 +116,10 @@ class _Owner:
     def allowed(self) -> bool:
         current = _task()
         grant = _child.get()
-        return not self.closed and (current is self.task or (
-            grant is not None and grant[0] is self and grant[1] is current))
+        return not self.closed and (
+            current is self.task
+            or (grant is not None and grant[0] is self and grant[1] is current)
+        )
 
 
 _owner: ContextVar[_Owner | None] = ContextVar("native_intrinsic_owner", default=None)
@@ -161,7 +166,9 @@ def validation_owner(*, borrow: bool = False):
         async def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
             with validation_scope(borrow=borrow):
                 return await function(*args, **kwargs)
+
         return wrapped
+
     return decorate
 
 

@@ -179,7 +179,9 @@ class _Views:
                 raise ValueError("assessment archive dangling view identity")
             view = self.views[identity]
             if view.input_json is None:
-                raise ValueError("assessment archive view reference requires inline input")
+                raise ValueError(
+                    "assessment archive view reference requires inline input"
+                )
             if not _same_wire(metadata, self.metadata[identity]):
                 raise ValueError("assessment archive view identity contents differ")
         else:

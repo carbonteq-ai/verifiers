@@ -49,9 +49,7 @@ RENDERER_DISTRIBUTIONS = tuple(
     (name, version(name))
     for name in sorted(packages_distributions().get("renderers", ()))
 )
-GENERATED_CALL_PARSER_REVISION = (
-    f"renderers-packages@{content_digest(RENDERER_DISTRIBUTIONS)}/generate-prefix-spans@1"
-)
+GENERATED_CALL_PARSER_REVISION = f"renderers-packages@{content_digest(RENDERER_DISTRIBUTIONS)}/generate-prefix-spans@1"
 
 
 def tool_to_wire(tool: Tool) -> dict:

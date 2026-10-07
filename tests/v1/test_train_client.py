@@ -8,7 +8,6 @@ from verifiers.v1.clients.train import ElasticRendererPool, response_from_genera
 from verifiers.v1.configs.client import TrainClientConfig
 
 
-
 def test_generated_call_attempts_keep_original_ordinals_and_sampled_spans():
     from renderers.base import ParsedToolCall, ToolCallParseStatus
 

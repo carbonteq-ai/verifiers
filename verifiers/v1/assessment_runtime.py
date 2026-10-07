@@ -176,7 +176,9 @@ async def _execute_admitted(
         run_values.update(status=status, reason=reason)
         if returned is not None:
             # Reparse even an existing model to check nested identity and validity.
-            returned = AssessmentBatch.model_validate(returned.model_dump(mode="python"))
+            returned = AssessmentBatch.model_validate(
+                returned.model_dump(mode="python")
+            )
             returned_source = returned.source
             identity = (
                 returned_source.identity

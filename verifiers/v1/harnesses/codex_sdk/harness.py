@@ -154,10 +154,14 @@ class CodexSdkSession(HarnessSession):
             "output_budget": harness.config.output_budget,
         }
         if set(harness.config.approved_mcp_tools) - set(aliases):
-            raise HarnessError("SDK approval policy references an unknown task MCP server")
+            raise HarnessError(
+                "SDK approval policy references an unknown task MCP server"
+            )
         self.trace.info["codex_sdk"] = {
             "sdk_version": "0.160.0",
-            "provider_mode": "signed_in" if harness.config.auth_file else "qualification",
+            "provider_mode": "signed_in"
+            if harness.config.auth_file
+            else "qualification",
             "fresh_thread_requested": True,
             "output_budget": harness.config.output_budget,
             "server_aliases": aliases,

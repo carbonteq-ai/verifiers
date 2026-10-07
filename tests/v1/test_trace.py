@@ -2013,7 +2013,9 @@ async def test_direct_harness_projection_rejects_self_consistent_copied_node_typ
         update = {"sampled": 1}
     elif change == "mask_integer":
         update = {
-            "mask": [1 if index == 2 else value for index, value in enumerate(node.mask)]
+            "mask": [
+                1 if index == 2 else value for index, value in enumerate(node.mask)
+            ]
         }
     else:
         # An unsampled prefix token keeps the generated completion digest intact.

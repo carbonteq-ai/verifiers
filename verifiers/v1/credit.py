@@ -512,10 +512,7 @@ async def execute_credit_assignment(
             result = await result
         if isinstance(result, CreditAssignment):
             result = CreditAssignment.model_validate(result.model_dump(mode="python"))
-            if (
-                result.request != request
-                or result.status == "running"
-            ):
+            if result.request != request or result.status == "running":
                 raise ValueError(
                     "rule changed request or returned a running assignment"
                 )

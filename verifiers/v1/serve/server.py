@@ -25,8 +25,6 @@ from verifiers.v1.utils.loaders import load_environment
 logger = logging.getLogger(__name__)
 
 
-
-
 def _pack_response(response: BaseResponse) -> bytes:
     """Encode a reply for the wire.
 
@@ -40,6 +38,7 @@ def _pack_response(response: BaseResponse) -> bytes:
         default=msgpack_encoder,
         use_bin_type=True,
     )
+
 
 class EnvServer:
     def __init__(

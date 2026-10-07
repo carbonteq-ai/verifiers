@@ -342,14 +342,34 @@ async def run_chat_loop(
                     route = None
                     if name in dispatch:
                         server_name, raw_tool = dispatch[name]
-                        route = {"server_name": server_name, "tool_name": raw_tool,
-                                 "arguments_json": json.dumps(tool_args, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)}
-                    dispatch_decision = await report("dispatch", 1, tool_message, mcp_dispatch=route)
+                        route = {
+                            "server_name": server_name,
+                            "tool_name": raw_tool,
+                            "arguments_json": json.dumps(
+                                tool_args,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                                ensure_ascii=False,
+                                allow_nan=False,
+                            ),
+                        }
+                    dispatch_decision = await report(
+                        "dispatch", 1, tool_message, mcp_dispatch=route
+                    )
                     try:
                         if name in dispatch:
                             ticket = dispatch_decision.get("mcp_dispatch_ticket")
-                            parent = {"parent_execution_id": execution_id, "dispatch_ticket": ticket} if type(ticket) is str and ticket else {}
-                            content = await call_mcp(servers, dispatch, name, tool_args, **parent)
+                            parent = (
+                                {
+                                    "parent_execution_id": execution_id,
+                                    "dispatch_ticket": ticket,
+                                }
+                                if type(ticket) is str and ticket
+                                else {}
+                            )
+                            content = await call_mcp(
+                                servers, dispatch, name, tool_args, **parent
+                            )
                         elif name == "bash":
                             content = await asyncio.to_thread(
                                 run_bash, tool_args.get("command", "")
