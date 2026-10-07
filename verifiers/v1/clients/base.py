@@ -17,7 +17,15 @@ queue (for example a local vLLM server serving many concurrent rollouts) can be 
 accept new connections; one slow accept used to fail the call and end its rollout."""
 CONNECT_BACKOFF_SECONDS = 0.5
 """First wait between connection attempts; it doubles after each failed attempt."""
-DEFAULT_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=100)
+# Idle connections expire before common providers close them (uvicorn, which serves vLLM,
+# closes idle keep-alive connections after 5 s). Reusing a connection the server is closing
+# fails the request with "server disconnected" after it was sent, which cannot be retried.
+KEEPALIVE_EXPIRY_SECONDS = 2.0
+DEFAULT_LIMITS = httpx.Limits(
+    max_connections=1000,
+    max_keepalive_connections=100,
+    keepalive_expiry=KEEPALIVE_EXPIRY_SECONDS,
+)
 MAX_RETRIES = 0
 """No client-side retries: failures surface to the harness SDK and the trace instead of
 being silently reattempted."""

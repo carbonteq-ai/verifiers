@@ -74,3 +74,13 @@ def test_failures_after_the_request_was_sent_are_not_retried(monkeypatch):
         )
     assert raised.value.status_code == 504
     assert len(calls) == 1
+
+
+def test_idle_connections_expire_before_the_provider_closes_them():
+    # uvicorn (vLLM's server) closes idle keep-alive connections after 5 s.
+    from verifiers.v1.clients.base import DEFAULT_LIMITS
+
+    assert (
+        DEFAULT_LIMITS.keepalive_expiry is not None
+        and DEFAULT_LIMITS.keepalive_expiry < 5.0
+    )
