@@ -1,5 +1,6 @@
 """The eval client: proxies harness-native request to the provider."""
 
+import asyncio
 import re
 from collections.abc import Mapping
 
@@ -7,7 +8,13 @@ import httpx
 from pydantic import ValidationError
 from pydantic_core import from_json, to_json
 
-from verifiers.v1.clients.base import DEFAULT_LIMITS, DEFAULT_TIMEOUT, join_url
+from verifiers.v1.clients.base import (
+    CONNECT_ATTEMPTS,
+    CONNECT_BACKOFF_SECONDS,
+    DEFAULT_LIMITS,
+    DEFAULT_TIMEOUT,
+    join_url,
+)
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client, RelayReply
 from verifiers.v1.configs.client import BaseClientConfig, resolve_api_key
 from verifiers.v1.dialects import Dialect
@@ -121,6 +128,21 @@ class EvalClient(Client):
         headers.update(dialect.auth_headers(self.api_key))
         return headers
 
+    async def _send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
+        """Send once a connection is established, retrying only the connection itself.
+
+        A connect timeout or refused connection means the provider never received the
+        request, so retrying it cannot duplicate work; every later failure surfaces as
+        before, without client-side retries."""
+        for attempt in range(CONNECT_ATTEMPTS):
+            try:
+                return await self.client.send(request, stream=stream)
+            except (httpx.ConnectTimeout, httpx.ConnectError):
+                if attempt + 1 == CONNECT_ATTEMPTS:
+                    raise
+                await asyncio.sleep(CONNECT_BACKOFF_SECONDS * 2**attempt)
+        raise AssertionError("unreachable")
+
     async def _request(
         self,
         url: str,
@@ -137,7 +159,7 @@ class EvalClient(Client):
             headers=headers,
         )
         try:
-            response = await self.client.send(request, stream=stream)
+            response = await self._send(request, stream=stream)
         except httpx.TimeoutException as e:
             raise model_error(str(e), status_code=504) from e
         except httpx.HTTPError as e:

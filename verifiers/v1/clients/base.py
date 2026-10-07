@@ -8,8 +8,15 @@ from openai import AsyncOpenAI
 from verifiers.v1.configs.client import BaseClientConfig, resolve_api_key
 
 # No read timeout: agentic completions are slow and the rollout timeout is the real
-# backstop. The connect bound stays so an unreachable endpoint still fails fast.
-DEFAULT_TIMEOUT = httpx.Timeout(connect=5.0, read=None, write=None, pool=None)
+# backstop. The connect bound stays so an unreachable endpoint still fails, after the
+# connection retries below.
+DEFAULT_TIMEOUT = httpx.Timeout(connect=15.0, read=None, write=None, pool=None)
+CONNECT_ATTEMPTS = 6
+"""Attempts to establish a connection before a request fails. A provider busy with a deep
+queue (for example a local vLLM server serving many concurrent rollouts) can be slow to
+accept new connections; one slow accept used to fail the call and end its rollout."""
+CONNECT_BACKOFF_SECONDS = 0.5
+"""First wait between connection attempts; it doubles after each failed attempt."""
 DEFAULT_LIMITS = httpx.Limits(max_connections=1000, max_keepalive_connections=100)
 MAX_RETRIES = 0
 """No client-side retries: failures surface to the harness SDK and the trace instead of
