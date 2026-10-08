@@ -870,7 +870,10 @@ def test_scoring_archive_rejects_boolean_node_identity_forgery(where):
     )
     archived = normalize_history({"assessment_batches": [{"source": source}]})
     if where == "reference":
-        archived["assessment_batches"][0]["source"]["nodes"][0]["node_index"] = True
+        # Older archives repeat the whole identity in each reference.
+        legacy = source.identity.model_dump(mode="json")
+        legacy["nodes"][0]["node_index"] = True
+        archived["assessment_batches"][0]["source"] = legacy
     else:
         archived["assessment_sources"][0]["nodes"][0]["node_index"] = True
     with pytest.raises(ValueError):
@@ -1131,11 +1134,12 @@ def test_scoring_archive_view_metadata_rejects_coerced_node_index(where, forged_
     payload = normalize_history(
         {"assessment_batches": [{"source": source, "views": [view]}]}
     )
-    target = (
-        payload["assessment_views"][0]
-        if where == "pooled-view"
-        else payload["assessment_batches"][0]["views"][0]["archive_view_ref"]
-    )
+    if where == "pooled-view":
+        target = payload["assessment_views"][0]
+    else:
+        # Older archives repeat all view metadata in each reference.
+        target = view.model_dump(mode="json", exclude={"input_json"})
+        payload["assessment_batches"][0]["views"][0] = {"archive_view_ref": target}
     target["subjects"][0]["node_index"] = forged_index
     with pytest.raises(ValueError):
         restore_history(payload)
@@ -1813,6 +1817,237 @@ def test_archive_serialization_still_rejects_conflicting_equal_identity_copies()
     trace = trace.model_copy(update={"assessment_batches": batches})
     with pytest.raises((PydanticSerializationError, ValueError)):
         trace.to_record()
+
+
+async def test_scoring_archive_lifecycle_batches_roundtrip_as_compact_deltas():
+    from pydantic import TypeAdapter
+
+    from verifiers.v1.assessment_archive import LIFECYCLE_OF
+    from verifiers.v1.assessment_runtime import execute_assessment
+    from verifiers.v1.episode import Episode
+    from verifiers.v1.serve.client import _decode_response
+    from verifiers.v1.serve.server import _pack_response
+    from verifiers.v1.serve.types import RunResponse
+    from verifiers.v1.trace import ToolServerExecutionEvent
+
+    source = _execution_source()
+    subject = _execution_subject(source)
+    padding = "LIFECYCLE_VIEW" * 512
+    view = vf.ObservationView.capture(
+        {"context": padding},
+        snapshot_id=source.snapshot_id,
+        builder_revision="lifecycle-v1",
+        scope="retrospective",
+        subjects=(subject,),
+    )
+    signals = [
+        vf.SignalDefinition(
+            signal_id=f"lifecycle.{name}",
+            revision="1",
+            semantics="other",
+            description=name,
+            units="binary",
+        )
+        for name in ("first", "second")
+    ]
+
+    def request(index):
+        run = vf.AssessmentRun(
+            run_id=f"lifecycle-run-{index}",
+            producer_id="lifecycle",
+            producer_revision="1",
+            rubric_revision="1",
+            snapshot_id=source.snapshot_id,
+            invocation_id=f"lifecycle-call-{index}",
+            attempt_id=f"lifecycle-attempt-{index}",
+            expected=tuple(
+                vf.AssessmentTarget(subject=subject, signal=signal)
+                for signal in signals
+            ),
+        )
+        return vf.AssessmentRequest(source=source.identity, run=run, views=(view,))
+
+    def finding(run, signal, value):
+        return vf.Assessment(
+            assessment_id=f"{run.run_id}-{signal.signal_id}",
+            run_id=run.run_id,
+            subject=subject,
+            view_id=view.view_id,
+            signal=signal,
+            status="valid",
+            value=value,
+        )
+
+    async def assess(request, context):
+        for value, signal in enumerate(signals):
+            context.record_evidence(
+                "response", {"value": value}, invocation_id=request.run.invocation_id
+            )
+            yield finding(request.run, signal, value)
+
+    async def fail(request, context):
+        yield finding(request.run, signals[0], 0)
+        raise RuntimeError("producer stopped")
+
+    retained = []
+    semaphore = asyncio.Semaphore(1)
+    await execute_assessment(assess, request(0), source, retained, semaphore=semaphore)
+    await execute_assessment(fail, request(1), source, retained, semaphore=semaphore)
+    await execute_assessment(assess, request(2), source, retained)
+    statuses = [batch.run.status for batch in retained]
+    assert statuses == [
+        *("queued", "running", "partial", "partial", "complete"),
+        *("queued", "running", "partial", "failed"),
+        *("running", "partial", "partial", "complete"),
+    ]
+    trace = vf.Trace(
+        id="trace",
+        episode_id="episode",
+        task=vf.TraceTask(type="Task", data=vf.TaskData(prompt="send")),
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        tool_execution_events=tuple(
+            ToolServerExecutionEvent.model_validate(event)
+            for event in json.loads(source.source_json)["tool_execution_events"]
+        ),
+        assessment_batches=retained,
+        is_completed=True,
+        ok=True,
+    )
+    adapter = TypeAdapter(vf.WireTrace)
+    for payload in (
+        json.loads(trace.model_dump_json()),
+        # The eval writer's form: absent reasons are written as missing fields.
+        json.loads(adapter.dump_json(trace, exclude_none=True)),
+    ):
+        batches = payload["assessment_batches"]
+        last = [batch for batch in batches if LIFECYCLE_OF not in batch]
+        assert [batch["run"]["status"] for batch in last] == [
+            "complete",
+            "failed",
+            "complete",
+        ]
+        assert json.dumps(payload).count(padding) == 1
+        assert source.source_json not in json.dumps(batches)
+        assert last[0]["source"] == {
+            "snapshot_id": source.snapshot_id,
+            "episode_id": source.episode_id,
+        }
+        assert set(last[0]["views"][0]["archive_view_ref"]) == {
+            "view_id",
+            "snapshot_id",
+            "builder_revision",
+            "scope",
+            "input_digest",
+        }
+        for index, batch in enumerate(batches):
+            if LIFECYCLE_OF not in batch:
+                continue
+            assert "source" not in batch and "views" not in batch
+            assert batch["schema_version"] == 1
+            assert batch["run"]["status"] == statuses[index]
+            final = batches[batch[LIFECYCLE_OF]]
+            assert final["run"]["attempt_id"] == batch["run"]["attempt_id"]
+            assert "configuration_json" not in batch["run"]
+        # Progress findings and receipts are prefixes of the attempt's last batch.
+        assert batches[2]["assessments"] == {"archive_prefix": 1}
+        assert batches[2]["run"]["execution_evidence"] == {"archive_prefix": 1}
+        assert "assessments" not in batches[3]
+        restored = vf.WireTrace.model_validate_json(json.dumps(payload))
+        assert restored.assessment_batches == retained
+        assert (
+            restored.assessment_batches[0].views[0]
+            is (restored.assessment_batches[-1].views[0])
+        )
+    assert any("archive_absent" in batch for batch in batches)
+    episode = Episode(
+        id="episode", task=trace.task, traces=[trace], assessment_batches=retained
+    )
+    reloaded = vf.WireEpisode.model_validate_json(episode.model_dump_json())
+    assert reloaded.assessment_batches == retained
+    assert reloaded.traces[0].assessment_batches == retained
+    data = _pack_response(
+        RunResponse.model_construct(success=True, error=None, episode=episode)
+    )
+    assert data.count(padding.encode()) == 2  # One pool per owner.
+    replied = _decode_response(RunResponse, data).episode
+    assert replied.assessment_batches == retained
+    assert replied.traces[0].assessment_batches == retained
+    assert replied.to_record() == episode.to_record()
+
+    payload = json.loads(trace.model_dump_json())
+    for mutation in ("other-attempt", "prefix", "forward", "chained", "field"):
+        forged = copy.deepcopy(payload)
+        batches = forged["assessment_batches"]
+        if mutation == "other-attempt":
+            batches[0][LIFECYCLE_OF] = 8
+        elif mutation == "prefix":
+            batches[2]["assessments"] = {"archive_prefix": 2}
+        elif mutation == "forward":
+            batches[4] = copy.deepcopy(batches[0])
+            batches[4][LIFECYCLE_OF] = 0
+        elif mutation == "chained":
+            batches[0][LIFECYCLE_OF] = 1
+        else:
+            batches[0]["views"] = []
+        with pytest.raises(ValueError):
+            vf.WireTrace.model_validate_json(json.dumps(forged))
+
+
+def test_scoring_archive_loads_recorded_legacy_trace():
+    import gzip
+    from pathlib import Path
+
+    from pydantic import TypeAdapter
+
+    from verifiers.v1.assessment_archive import LIFECYCLE_OF
+
+    # An AutomationBench eval record from before compact references and
+    # lifecycle deltas, trimmed to one attempt and its pooled evidence.
+    fixture = Path(__file__).parent / "fixtures" / "assessment_archive_legacy.json.gz"
+    legacy = json.loads(gzip.decompress(fixture.read_bytes()))
+    recorded = legacy["assessment_batches"]
+    assert all(
+        "nodes" in batch["source"]
+        and "subjects" in batch["views"][0]["archive_view_ref"]
+        for batch in recorded
+    )
+    trace = vf.WireTrace.model_validate(copy.deepcopy(legacy))
+    batches = trace.assessment_batches
+    assert [batch.run.status for batch in batches] == [
+        "queued",
+        "running",
+        "partial",
+        "complete",
+    ]
+    (pooled,) = legacy["assessment_sources"]
+    for batch, raw in zip(batches, recorded, strict=True):
+        assert batch.source.model_dump(mode="json") == pooled
+        assert batch.run.model_dump(mode="json", exclude_none=True) == raw["run"]
+        assert [
+            item.model_dump(mode="json", exclude_none=True)
+            for item in batch.assessments
+        ] == raw["assessments"]
+        assert [view.view_id for view in batch.views] == [
+            view["archive_view_ref"]["view_id"] for view in raw["views"]
+        ]
+    compact = json.loads(TypeAdapter(vf.WireTrace).dump_json(trace, exclude_none=True))
+    assert compact["assessment_sources"] == legacy["assessment_sources"]
+    assert compact["assessment_views"] == legacy["assessment_views"]
+    assert [LIFECYCLE_OF in batch for batch in compact["assessment_batches"]] == [
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert compact["assessment_batches"][-1]["run"] == recorded[-1]["run"]
+    assert (
+        compact["assessment_batches"][-1]["assessments"]
+        == (recorded[-1]["assessments"])
+    )
+    assert len(json.dumps(compact["assessment_batches"])) * 6 < len(
+        json.dumps(recorded)
+    )
+    assert vf.WireTrace.model_validate(compact).assessment_batches == batches
 
 
 def test_env_server_reply_pools_assessment_evidence_and_restores_identically():
