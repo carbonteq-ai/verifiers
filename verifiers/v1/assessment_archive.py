@@ -3,6 +3,24 @@
 Trace and Episode own their respective histories. These helpers do not traverse
 child traces, change standalone batch formats, or introduce an external store.
 Restoration supplies full validated snapshots to the existing native validators.
+
+In the archive form each full source and inline view appears once per owner, in
+``assessment_sources`` and ``assessment_views``. A batch or credit request names
+its source by a compact reference (``snapshot_id`` and ``episode_id``) and each
+inline view by ``{"archive_view_ref": {view_id, snapshot_id, builder_revision,
+scope, input_digest}}``. Both identities are content digests that the pooled
+entry is verified against, so the omitted coordinates add no integrity. Older
+archives whose references repeat every coordinate still load: any coordinate a
+reference supplies must equal the pooled entry's.
+
+An assessment attempt retains its queued, running and progress batches before
+its last batch; they are lifecycle evidence that task credit planners and
+calibration inspect. The archive keeps every one, but writes an earlier batch of
+an attempt as a delta against that attempt's last batch (``LIFECYCLE_OF``):
+only run fields that differ, plus the run identity coordinates, and its
+assessments as a prefix count when they are a prefix of the last batch's. The
+last batch of each attempt stays complete. Restoration rebuilds the exact batch
+dictionaries before native validation.
 """
 
 from __future__ import annotations
@@ -25,6 +43,31 @@ JSON-mode dumps always use the pooled form. A Python-mode caller that ships the
 dump elsewhere (the env server's msgpack reply) sets this key to ``True`` so
 each full source and view travels once instead of once per batch.
 """
+
+
+LIFECYCLE_OF = "archive_lifecycle_of"
+"""Archive-form key of an earlier lifecycle batch: index of its attempt's last batch."""
+
+_PREFIX = "archive_prefix"
+_ABSENT = "archive_absent"
+_DELTA_KEYS = {LIFECYCLE_OF, "schema_version", "run", "assessments", _ABSENT}
+_ATTEMPT = ("run_id", "invocation_id", "attempt_id")
+# Always written on a delta so raw readers can key and order every batch.
+_RUN_COORDINATES = (
+    "run_id",
+    "producer_id",
+    "snapshot_id",
+    "invocation_id",
+    "attempt_id",
+    "status",
+)
+_VIEW_REFERENCE = (
+    "view_id",
+    "snapshot_id",
+    "builder_revision",
+    "scope",
+    "input_digest",
+)
 
 
 def _mapping(value: Any, label: str) -> dict[str, Any]:
@@ -59,6 +102,13 @@ def _same_wire(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _same_supplied(reference: dict[str, Any], pooled: dict[str, Any]) -> bool:
+    """Every coordinate a reference supplies equals the pooled entry's exactly."""
+    return reference.keys() <= pooled.keys() and all(
+        _same_wire(value, pooled[key]) for key, value in reference.items()
+    )
+
+
 def _provided_fields_match(raw: Any, validated: Any) -> bool:
     """Reject coercion of supplied coordinates, while allowing legacy defaults.
 
@@ -81,6 +131,7 @@ class _Sources:
         self.raw: dict[str, dict[str, Any]] = {}
         self.snapshots: dict[str, SourceSnapshot] = {}
         self.identities: dict[str, dict[str, Any]] = {}
+        self.references: dict[str, dict[str, Any]] = {}
         self.pool_ids: set[str] = set()
         self.used: set[str] = set()
 
@@ -104,6 +155,10 @@ class _Sources:
         self.raw[identity] = raw
         self.snapshots[identity] = snapshot
         self.identities[identity] = snapshot.identity.model_dump(mode="json")
+        self.references[identity] = {
+            "snapshot_id": snapshot.snapshot_id,
+            "episode_id": snapshot.episode_id,
+        }
         return snapshot
 
     def resolve(self, value: Any) -> SourceSnapshot:
@@ -114,7 +169,11 @@ class _Sources:
             identity = raw.get("snapshot_id")
             if not isinstance(identity, str) or identity not in self.snapshots:
                 raise ValueError("assessment archive dangling source identity")
-            if not _same_wire(raw, self.identities[identity]):
+            # Compact references name the snapshot; older archives repeat its
+            # whole identity. Either way, supplied coordinates must match.
+            if "snapshot_id" not in raw or not _same_supplied(
+                raw, self.identities[identity]
+            ):
                 raise ValueError("assessment archive source identity contents differ")
             snapshot = self.snapshots[identity]
         self.used.add(snapshot.snapshot_id)
@@ -146,6 +205,7 @@ class _Views:
         self.raw: dict[str, dict[str, Any]] = {}
         self.views: dict[str, ObservationView] = {}
         self.metadata: dict[str, dict[str, Any]] = {}
+        self.references: dict[str, dict[str, Any]] = {}
         self.pool_ids: set[str] = set()
         self.used: set[str] = set()
 
@@ -166,6 +226,11 @@ class _Views:
         self.metadata[identity] = {
             key: value for key, value in canonical.items() if key != "input_json"
         }
+        self.references[identity] = {
+            "archive_view_ref": {
+                key: canonical[key] for key in _VIEW_REFERENCE if key in canonical
+            }
+        }
         return view
 
     def resolve(self, value: Any) -> ObservationView:
@@ -182,7 +247,7 @@ class _Views:
                 raise ValueError(
                     "assessment archive view reference requires inline input"
                 )
-            if not _same_wire(metadata, self.metadata[identity]):
+            if not _same_supplied(metadata, self.metadata[identity]):
                 raise ValueError("assessment archive view identity contents differ")
         else:
             view = self.admit(raw)
@@ -226,6 +291,135 @@ def _placeholder(value: Any, token: str | None, kind: str) -> str | None:
     return None
 
 
+def _attempt(batch: Any) -> tuple[Any, ...] | None:
+    run = batch.get("run") if type(batch) is dict else None
+    if type(run) is not dict or any(type(run.get(key)) is not str for key in _ATTEMPT):
+        return None
+    return tuple(run[key] for key in _ATTEMPT)
+
+
+def _delta_value(value: Any, last: Any) -> Any:
+    """A proper nonempty prefix of the last batch's sequence as its length."""
+    if (
+        isinstance(value, (list, tuple))
+        and type(value) is type(last)
+        and 0 < len(value) < len(last)
+        and all(_same_wire(a, b) for a, b in zip(value, last, strict=False))
+    ):
+        return {_PREFIX: len(value)}
+    return value
+
+
+def _lifecycle_delta(
+    batch: dict[str, Any], last: dict[str, Any], index: int
+) -> dict[str, Any] | None:
+    if batch.keys() != last.keys() or any(
+        not _same_wire(value, last[key])
+        for key, value in batch.items()
+        if key not in {"run", "assessments"}
+    ):
+        return None
+    run, last_run = batch["run"], last["run"]
+    delta_run = {key: run[key] for key in _RUN_COORDINATES if key in run}
+    for key, value in run.items():
+        if key not in delta_run and (
+            key not in last_run or not _same_wire(value, last_run[key])
+        ):
+            delta_run[key] = _delta_value(value, last_run.get(key))
+    delta: dict[str, Any] = {}
+    if "schema_version" in batch:
+        delta["schema_version"] = batch["schema_version"]
+    delta[LIFECYCLE_OF] = index
+    delta["run"] = delta_run
+    if "assessments" in batch and not _same_wire(
+        batch["assessments"], last["assessments"]
+    ):
+        delta["assessments"] = _delta_value(batch["assessments"], last["assessments"])
+    if absent := [key for key in last_run if key not in run]:
+        delta[_ABSENT] = absent
+    return delta
+
+
+def _compact_lifecycle(batches: list[Any]) -> list[Any]:
+    """Write each attempt's earlier batches as deltas against its last batch."""
+    last: dict[tuple[Any, ...], int] = {}
+    for index, batch in enumerate(batches):
+        if (attempt := _attempt(batch)) is not None:
+            last[attempt] = index
+    compact = []
+    for index, batch in enumerate(batches):
+        attempt = _attempt(batch)
+        final = last.get(attempt) if attempt is not None else None
+        delta = None
+        if final is not None and final != index:
+            delta = _lifecycle_delta(batch, batches[final], final)
+        compact.append(batch if delta is None else delta)
+    return compact
+
+
+def _expanded_value(value: Any, last: Any, label: str) -> Any:
+    if type(value) is not dict:
+        return value
+    count = value.get(_PREFIX)
+    if (
+        set(value) != {_PREFIX}
+        or type(count) is not int
+        or not isinstance(last, (list, tuple))
+        or not 0 < count < len(last)
+    ):
+        raise ValueError(f"assessment archive lifecycle {label} prefix is invalid")
+    return last[:count]
+
+
+def _expand_lifecycle(batches: list[Any] | tuple[Any, ...]) -> list[Any]:
+    """Rebuild lifecycle deltas from their attempt's complete last batch."""
+    if not any(type(item) is dict and LIFECYCLE_OF in item for item in batches):
+        return list(batches)
+    expanded = []
+    for index, item in enumerate(batches):
+        if type(item) is not dict or LIFECYCLE_OF not in item:
+            expanded.append(item)
+            continue
+        final = item[LIFECYCLE_OF]
+        if (
+            not item.keys() <= _DELTA_KEYS
+            or type(final) is not int
+            or not index < final < len(batches)
+        ):
+            raise ValueError("assessment archive lifecycle reference is invalid")
+        last = _mapping(batches[final], "lifecycle batch")
+        if LIFECYCLE_OF in last:
+            raise ValueError("assessment archive lifecycle reference is not complete")
+        last_run = _mapping(last.get("run"), "lifecycle run")
+        delta_run = item.get("run")
+        if type(delta_run) is not dict or any(
+            key not in delta_run or not _same_wire(delta_run[key], last_run.get(key))
+            for key in _ATTEMPT
+        ):
+            raise ValueError("assessment archive lifecycle names another attempt")
+        if "schema_version" in item and (
+            "schema_version" not in last
+            or not _same_wire(item["schema_version"], last["schema_version"])
+        ):
+            raise ValueError("assessment archive lifecycle schema differs")
+        run = dict(last_run)
+        absent = item.get(_ABSENT, [])
+        if type(absent) is not list or any(key not in run for key in absent):
+            raise ValueError("assessment archive lifecycle absent fields are invalid")
+        for key in absent:
+            del run[key]
+        for key, value in delta_run.items():
+            run[key] = _expanded_value(value, last_run.get(key), "run")
+        batch = dict(last)
+        batch["run"] = run
+        if "assessments" in item:
+            batch["assessments"] = _expanded_value(
+                item["assessments"], last.get("assessments"), "assessment"
+            )
+        expanded.append(batch)
+    return expanded
+
+
 def _rewrite(
     data: dict[str, Any], *, restore: bool, token: str | None = None
 ) -> tuple[dict[str, Any], int]:
@@ -252,9 +446,9 @@ def _rewrite(
             sources.used.add(identity)
             if restore:
                 return sources.snapshots[identity]
-            return sources.identities[identity]
+            return sources.references[identity]
         snapshot = sources.resolve(value)
-        return snapshot if restore else sources.identities[snapshot.snapshot_id]
+        return snapshot if restore else sources.references[snapshot.snapshot_id]
 
     def view_value(value: Any) -> ObservationView | dict[str, Any]:
         nonlocal resolved
@@ -269,7 +463,7 @@ def _rewrite(
                 return view
             if view.input_json is None:
                 return view.model_dump(mode="json")
-            return {"archive_view_ref": views.metadata[identity]}
+            return views.references[identity]
         view = views.resolve(value)
         if restore:
             return view
@@ -277,7 +471,7 @@ def _rewrite(
             # Artifact-backed views are already compact. Keep their native
             # representation and do not invent artifact resolution here.
             return view.model_dump(mode="json")
-        return {"archive_view_ref": views.metadata[view.view_id]}
+        return views.references[view.view_id]
 
     for field in ("assessment_batches", "credit_assignments"):
         if field not in data:
@@ -287,6 +481,8 @@ def _rewrite(
             raise ValueError(  # noqa: TRY004 - surfaced through native model validators
                 f"assessment archive {field} must be a sequence"
             )
+        if field == "assessment_batches":
+            history = _expand_lifecycle(history)
         rewritten = []
         for value in history:
             item = dict(_mapping(value, field))
@@ -308,6 +504,8 @@ def _rewrite(
                 request["source"] = source_value(request["source"])
                 item["request"] = request
             rewritten.append(item)
+        if field == "assessment_batches" and not restore:
+            rewritten = _compact_lifecycle(rewritten)
         result[field] = rewritten
     if sources.pool_ids - sources.used:
         raise ValueError("assessment archive unused pooled source")

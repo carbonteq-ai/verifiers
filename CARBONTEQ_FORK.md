@@ -315,6 +315,39 @@ Implementation commits: `b50265738` (archive loading) and `d793cc6ee`
 (scoring, serialization and replies) on `codex/native-assessment-runtime-cost`;
 the consumer selection is recorded in Posttrain `docs/tooling/verifiers/README.md`.
 
+### Compact archive references and lifecycle deltas
+
+Pooling stored each source and view body once, but every batch still repeated
+the full source identity (all node, trace and execution coordinates) and view
+metadata (all subjects), about 32 KB per batch on AutomationBench; the four
+lifecycle batches of each attempt also repeated its run and findings. In the
+archive form (`verifiers/v1/assessment_archive.py`) a batch or credit request
+now names its source as `{snapshot_id, episode_id}` and each inline view as
+`archive_view_ref` with `view_id`, `snapshot_id`, `builder_revision`, `scope`
+and `input_digest`. Both identities are content digests of the verified pooled
+entries, so nothing is lost. An attempt's queued, running and progress batches
+are kept, because task credit planners (AutomationBench
+`manifest_assessments.plan_credit` checks lifecycle progression) and
+calibration inspect them. Each is written as a delta against the attempt's
+last batch (`archive_lifecycle_of`): run coordinates, differing run fields,
+and assessments or receipts as a prefix length. Restoration rebuilds identical
+in-memory batches. Older archives with full references still load: supplied
+coordinates must equal the pooled entry's. Older Verifiers cannot read the new
+form. Raw readers that keep the last batch per run key (Posttrain's Trackio
+results projection) see the same results, since the last batch stays complete.
+
+On the 100-episode AutomationBench eval `luna2-heldout-64k20t-t05-v2-final`
+(902 MB of `write_episode` output) the same episodes write 140 MB, with no
+episode over 10 MB (11 before). All 100 restore to identical batches and
+assignments. The largest `support.zendesk_hubspot_org_sync` episode (3,936
+batches) falls from 138.7 MB to 7.5 MB; loading takes 0.76 s instead of 2.21 s,
+and writing 0.16 s instead of 0.65 s. Its env-server reply falls from 124.7 MB
+to 6.8 MB. Regressions in `tests/v1/test_scoring.py`:
+`test_scoring_archive_lifecycle_batches_roundtrip_as_compact_deltas` (JSON,
+eval-writer and msgpack reply round trips plus forged deltas) and
+`test_scoring_archive_loads_recorded_legacy_trace` (a trimmed recorded
+AutomationBench trace, `tests/v1/fixtures/assessment_archive_legacy.json.gz`).
+
 ## Regression and compatibility
 
 Use Python 3.13 and the selected upstream lock. The real local subprocess/null
