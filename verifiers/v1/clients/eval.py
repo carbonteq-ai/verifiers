@@ -66,6 +66,22 @@ _BLOCKED_REQUEST_HEADERS = (
 _SSE_EVENT_END = re.compile(rb"(?>\r\n|\r|\n){2}")
 
 
+_RETRYABLE_TRANSPORT = (
+    httpx.ConnectTimeout,
+    httpx.ConnectError,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+    ConnectionResetError,
+)
+"""Transport failures raised before a response arrived (see `EvalClient._send`)."""
+
+
+def _describe(error: BaseException) -> str:
+    """The error's message, or its type when it stringifies empty (httpx often does)."""
+    return str(error) or type(error).__name__
+
+
 class EvalClient(Client):
     """Relay native JSON to the provider and parse a copy for the trace."""
 
@@ -129,15 +145,17 @@ class EvalClient(Client):
         return headers
 
     async def _send(self, request: httpx.Request, *, stream: bool) -> httpx.Response:
-        """Send once a connection is established, retrying only the connection itself.
+        """Send the request, retrying transport failures that happen before any response.
 
         A connect timeout or refused connection means the provider never received the
-        request, so retrying it cannot duplicate work; every later failure surfaces as
-        before, without client-side retries."""
+        request. A connection the provider closed or reset before sending response headers
+        returned nothing; a model request has no provider-side effects, so sending it again
+        can at most repeat generation work. Failures after the response started, timeouts
+        while waiting for it, and every HTTP error status surface as before."""
         for attempt in range(CONNECT_ATTEMPTS):
             try:
                 return await self.client.send(request, stream=stream)
-            except (httpx.ConnectTimeout, httpx.ConnectError):
+            except _RETRYABLE_TRANSPORT:
                 if attempt + 1 == CONNECT_ATTEMPTS:
                     raise
                 await asyncio.sleep(CONNECT_BACKOFF_SECONDS * 2**attempt)
@@ -161,11 +179,11 @@ class EvalClient(Client):
         try:
             response = await self._send(request, stream=stream)
         except httpx.TimeoutException as e:
-            raise model_error(str(e), status_code=504) from e
+            raise model_error(_describe(e), status_code=504) from e
         except httpx.HTTPError as e:
-            raise model_error(str(e), status_code=503) from e
+            raise model_error(_describe(e), status_code=503) from e
         except ConnectionResetError as e:
-            raise model_error(str(e), status_code=503) from e
+            raise model_error(_describe(e), status_code=503) from e
         if not stream:
             try:
                 response.raise_for_status()

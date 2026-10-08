@@ -84,3 +84,39 @@ def test_idle_connections_expire_before_the_provider_closes_them():
         DEFAULT_LIMITS.keepalive_expiry is not None
         and DEFAULT_LIMITS.keepalive_expiry < 5.0
     )
+
+
+def test_a_connection_closed_before_any_response_is_retried(monkeypatch):
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) == 1:
+            raise httpx.RemoteProtocolError(
+                "Server disconnected without sending a response.", request=request
+            )
+        if len(calls) == 2:
+            raise httpx.ReadError("", request=request)
+        return httpx.Response(200, json={"ok": True})
+
+    client = client_with(handler, monkeypatch)
+    response = asyncio.run(
+        client._request("http://provider.test/v1/chat/completions", {}, httpx.Headers())
+    )
+    assert response.json() == {"ok": True}
+    assert len(calls) == 3
+
+
+def test_an_empty_transport_error_reports_its_type(monkeypatch):
+    def handler(request):
+        raise httpx.ReadError("", request=request)
+
+    client = client_with(handler, monkeypatch)
+    with pytest.raises(ProviderError) as raised:
+        asyncio.run(
+            client._request(
+                "http://provider.test/v1/chat/completions", {}, httpx.Headers()
+            )
+        )
+    assert raised.value.status_code == 503
+    assert "ReadError" in str(raised.value)
