@@ -388,7 +388,20 @@ run fork and consumer compatibility suites, then build and clean-install the
 wheel. Publish only immutable CarbonTeq commits and move consumer pins only
 after qualification.
 
-Published release: `carbonteq-v0.3.2.dev102` (GitHub release, prerelease) at
+Published release: `carbonteq-v0.3.2.dev109` (GitHub release) at immutable
+commit `bc70a7deaf64c8f8e0b41e39c00ac2d1ea1d7e0b` on
+`codex/carbonteq-verifiers-latest` (a merge of `c4ba45e11` into the dev102
+release line). Retained wheel SHA-256
+`0b2bffc55471fbe3666c3b691822895e9a1bb77b7419893bfceb1b488916d16c`, source
+distribution `ecd52fb894305e96249f8b0e13219ee5bbc4c5a32e82abeb88ab0d29f3254d91`.
+It adds the eval-client transport retries (connect retry with backoff, 2 s
+keep-alive expiry, retry of connections closed before any response, named empty
+errors) and the compact archive references and lifecycle deltas described
+above. Readers older than dev109 cannot read traces written in the compact form.
+Consumer revision: Posttrain 0.4.16 and verifiers-environments
+`carbonteq-2026.10.08` select this commit.
+
+Previous release: `carbonteq-v0.3.2.dev102` (GitHub release, prerelease) at
 immutable commit `74dd3fbf176d60cb0070f2408bc8a597bbfc099e` on `codex/carbonteq-verifiers-latest`
 (`74dd3fbf1` is `58df1306` plus repository formatting, no behavior change).
 Retained wheel SHA-256
@@ -397,7 +410,7 @@ distribution `4d48235af8620c9958493449a8518b3e838ac0188705c3af77eb6e41b8148e23`.
 It includes the native assessment and credit runtime, submitted-argument
 receipts, pooled assessment archives and scoped validation-proof reuse described
 in the candidate sections below, which are now published.
-Consumer revision: Posttrain 0.4.15 selects this commit.
+Consumer revision: Posttrain 0.4.15 selected this commit.
 
 ## Local assessment source-admission candidate (2026-10-04)
 
